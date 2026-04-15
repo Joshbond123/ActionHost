@@ -164,7 +164,7 @@ async function startServer() {
       if (depError) throw depError;
 
       // 2. Trigger GitHub Action
-      const [owner, repo] = process.env.GITHUB_REPO_PATH?.split("/") || ["owner", "repo"];
+      const [owner, repo] = process.env.ACTIONHOST_REPO_PATH?.split("/") || ["owner", "repo"];
       await octokit.rest.actions.createWorkflowDispatch({
         owner,
         repo,

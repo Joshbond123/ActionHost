@@ -1,780 +1,350 @@
-import React, { useState, useEffect } from "react";
-import { 
-  Layout, 
-  Plus, 
-  Settings as SettingsIcon, 
-  Activity, 
-  Globe, 
-  Github, 
-  Terminal, 
-  Shield, 
-  RefreshCw,
-  ExternalLink,
-  ChevronRight,
-  AlertCircle,
-  CheckCircle2,
-  Clock,
-  Menu,
-  X
-} from "lucide-react";
-import { motion, AnimatePresence } from "motion/react";
-import { cn } from "@/src/lib/utils";
-import { supabase } from "@/src/lib/supabase";
-import { Project, Deployment, ProjectStatus, CerebrasKey } from "./types";
+import { ReactNode, useEffect, useMemo, useState } from 'react';
+import { Activity, AlertCircle, ExternalLink, Github, Globe, RefreshCw, Settings } from 'lucide-react';
+import { motion } from 'motion/react';
+import { cn } from '@/src/lib/utils';
+import { functionsBaseUrl, hasSupabaseConfig, supabase } from '@/src/lib/supabase';
+import { Deployment, LogEntry, Project, ProjectStatus } from './types';
 
-// Mock data for initial UI development
-const MOCK_PROJECTS: Project[] = [
-  {
-    id: "1",
-    name: "My Awesome App",
-    repo_url: "https://github.com/user/repo",
-    cloudflare_zone_id: "zone123",
-    cloudflare_api_token: "cf_token",
-    github_pat: "ghp_pat",
-    domain: "example.com",
-    subdomain: "app",
-    framework: "Next.js",
-    created_at: new Date().toISOString(),
-  }
-];
+type Tab = 'dashboard' | 'deploy' | 'settings';
 
-const MOCK_DEPLOYMENTS: Deployment[] = [
-  {
-    id: "d1",
-    project_id: "1",
-    status: "active",
-    public_url: "https://temp-url.actionhost.app",
-    created_at: new Date().toISOString(),
-    expires_at: new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString(),
-  }
-];
+type DeployPayload = {
+  repoUrl: string;
+  cloudflareApiToken: string;
+  cloudflareZoneId: string;
+  domain: string;
+  subdomain?: string;
+};
+
+const STATUS_STYLES: Record<ProjectStatus, string> = {
+  queued: 'bg-slate-100 text-slate-700 border-slate-300',
+  starting: 'bg-blue-50 text-blue-700 border-blue-200',
+  warming: 'bg-amber-50 text-amber-700 border-amber-200',
+  ready: 'bg-indigo-50 text-indigo-700 border-indigo-200',
+  active: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+  draining: 'bg-orange-50 text-orange-700 border-orange-200',
+  stopped: 'bg-zinc-100 text-zinc-700 border-zinc-200',
+  failed: 'bg-red-50 text-red-700 border-red-200',
+};
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<"dashboard" | "new" | "settings">("dashboard");
+  const [tab, setTab] = useState<Tab>('dashboard');
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [repoUrl, setRepoUrl] = useState("");
-  const [domain, setDomain] = useState("");
-  const [subdomain, setSubdomain] = useState("");
-  const [zoneId, setZoneId] = useState("");
-  const [analysis, setAnalysis] = useState<any>(null);
-  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
-  const [githubPat, setGithubPat] = useState("");
-  const [cloudflareToken, setCloudflareToken] = useState("");
-  const [cerebrasKeys, setCerebrasKeys] = useState<CerebrasKey[]>([]);
-  const [newCerebrasKey, setNewCerebrasKey] = useState("");
+  const [deploying, setDeploying] = useState(false);
+  const [error, setError] = useState('');
+  const [success, setSuccess] = useState('');
+  const [cerebrasKey, setCerebrasKey] = useState('');
+  const [form, setForm] = useState<DeployPayload>({
+    repoUrl: '',
+    cloudflareApiToken: '',
+    cloudflareZoneId: '',
+    domain: '',
+    subdomain: '',
+  });
 
   useEffect(() => {
     if (!supabase) return;
-    fetchProjects();
-    fetchCerebrasKeys();
-    
-    // Subscribe to changes
-    const projectsSub = supabase
-      .channel('projects-all')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'projects' }, fetchProjects)
-      .subscribe();
-
-    const keysSub = supabase
-      .channel('cerebras-keys')
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'cerebras_keys' }, fetchCerebrasKeys)
+    loadProjects();
+    const channel = supabase
+      .channel('projects-dashboard-live')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'projects' }, loadProjects)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'deployments' }, loadProjects)
       .subscribe();
 
     return () => {
-      supabase.removeChannel(projectsSub);
-      supabase.removeChannel(keysSub);
+      supabase.removeChannel(channel);
     };
   }, []);
 
-  const fetchProjects = async () => {
+  const loadProjects = async () => {
     if (!supabase) return;
-    const { data } = await supabase.from("projects").select("*").order("created_at", { ascending: false });
-    if (data) setProjects(data);
-  };
+    const { data, error: dbError } = await supabase
+      .from('projects')
+      .select('*,deployments(*)')
+      .order('created_at', { ascending: false });
 
-  const fetchCerebrasKeys = async () => {
-    if (!supabase) return;
-    const { data } = await supabase.from("cerebras_keys").select("*").order("created_at", { ascending: false });
-    if (data) setCerebrasKeys(data);
-  };
-
-  const handleAddCerebrasKey = async () => {
-    if (!supabase || !newCerebrasKey) return;
-    try {
-      const { error } = await supabase.from("cerebras_keys").insert({ key: newCerebrasKey });
-      if (error) throw error;
-      setNewCerebrasKey("");
-      fetchCerebrasKeys();
-    } catch (error) {
-      console.error("Failed to add key", error);
+    if (dbError) {
+      setError(dbError.message);
+      return;
     }
-  };
 
-  const handleDeleteCerebrasKey = async (id: string) => {
-    if (!supabase) return;
-    try {
-      const { error } = await supabase.from("cerebras_keys").delete().eq("id", id);
-      if (error) throw error;
-      fetchCerebrasKeys();
-    } catch (error) {
-      console.error("Failed to delete key", error);
-    }
-  };
+    const normalized: Project[] = (data ?? []).map((item: any) => ({
+      ...item,
+      deployments: (item.deployments ?? []).sort(
+        (a: Deployment, b: Deployment) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+      ),
+    }));
 
-  const handleAnalyze = async () => {
-    setLoading(true);
-    try {
-      const res = await fetch("/api/analyze", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ repoUrl, githubPat })
-      });
-      const data = await res.json();
-      setAnalysis(data);
-    } catch (error) {
-      console.error("Analysis failed", error);
-    } finally {
-      setLoading(false);
-    }
+    setProjects(normalized);
   };
 
   const handleDeploy = async () => {
-    setLoading(true);
+    setDeploying(true);
+    setError('');
+    setSuccess('');
+
     try {
-      if (!supabase) throw new Error("Supabase is not configured. Please add SUPABASE_URL and SUPABASE_ANON_KEY to your secrets.");
-      if (!githubPat || !cloudflareToken) throw new Error("GitHub PAT and Cloudflare API Token are required for deployment.");
-
-      // 1. Create project
-      const { data: project, error } = await supabase.from("projects").insert({
-        name: repoUrl.split("/").pop()?.replace(".git", "") || "New Project",
-        repo_url: repoUrl,
-        domain,
-        subdomain,
-        cloudflare_zone_id: zoneId,
-        cloudflare_api_token: cloudflareToken,
-        github_pat: githubPat,
-        framework: analysis?.framework,
-        build_command: analysis?.build_command,
-        start_command: analysis?.start_command
-      }).select().single();
-
-      if (error) throw error;
-
-      // 2. Trigger deployment
-      await fetch("/api/deploy", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          projectId: project.id,
-          repoUrl,
-          buildCommand: analysis?.build_command,
-          startCommand: analysis?.start_command,
-          githubPat,
-          cloudflareToken
-        })
+      if (!functionsBaseUrl) throw new Error('VITE_SUPABASE_FUNCTIONS_BASE_URL is missing.');
+      const response = await fetch(`${functionsBaseUrl}/deploy`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(form),
       });
 
-      setActiveTab("dashboard");
-      setRepoUrl("");
-      setAnalysis(null);
-      setGithubPat("");
-      setCloudflareToken("");
-    } catch (error: any) {
-      console.error("Deployment failed", error);
-      alert(error.message);
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.error ?? 'Deployment request failed.');
+      }
+
+      setForm({ repoUrl: '', cloudflareApiToken: '', cloudflareZoneId: '', domain: '', subdomain: '' });
+      setSuccess(`Deployment queued: ${payload.deploymentId}`);
+      setTab('dashboard');
+      await loadProjects();
+    } catch (err: any) {
+      setError(err.message ?? 'Deployment failed.');
     } finally {
-      setLoading(false);
+      setDeploying(false);
     }
   };
 
+  const saveSettings = async () => {
+    setError('');
+    setSuccess('');
+
+    try {
+      if (!functionsBaseUrl) throw new Error('VITE_SUPABASE_FUNCTIONS_BASE_URL is missing.');
+      const response = await fetch(`${functionsBaseUrl}/save-settings`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cerebrasApiKey: cerebrasKey }),
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error ?? 'Settings save failed');
+      setSuccess('Settings saved securely.');
+      setCerebrasKey('');
+    } catch (err: any) {
+      setError(err.message ?? 'Settings save failed.');
+    }
+  };
+
+  const stats = useMemo(() => {
+    const active = projects.filter((p) => p.deployments?.[0]?.status === 'active').length;
+    const queued = projects.filter((p) => p.deployments?.[0]?.status === 'queued').length;
+    return { total: projects.length, active, queued };
+  }, [projects]);
+
+  if (!hasSupabaseConfig) {
+    return (
+      <main className="min-h-screen bg-bg p-8 flex items-center justify-center">
+        <div className="max-w-xl rounded-xl border border-border bg-card-bg p-8 text-center">
+          <AlertCircle className="mx-auto w-10 h-10 text-warning" />
+          <h1 className="text-2xl font-bold mt-3">Supabase configuration missing</h1>
+          <p className="text-sm text-text-muted mt-2">Set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY before running ActionHost.</p>
+        </div>
+      </main>
+    );
+  }
+
   return (
-    <div className="min-h-screen bg-bg text-text-main font-sans selection:bg-primary selection:text-white">
-      {/* Mobile Sidebar Overlay */}
-      <AnimatePresence>
-        {isSidebarOpen && (
-          <motion.div 
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            onClick={() => setIsSidebarOpen(false)}
-            className="fixed inset-0 bg-black/50 z-[60] md:hidden"
-          />
-        )}
-      </AnimatePresence>
-
-      {/* Sidebar */}
-      <aside className={cn(
-        "fixed left-0 top-0 h-full w-60 bg-sidebar-bg z-[70] flex flex-col transition-transform duration-300 md:translate-x-0",
-        isSidebarOpen ? "translate-x-0" : "-translate-x-full"
-      )}>
-        <div className="p-6 flex items-center justify-between mb-4">
-          <div className="flex items-center gap-2">
-            <div className="w-8 h-8 bg-primary/20 rounded-lg flex items-center justify-center">
-              <Activity className="text-[#38BDF8] w-5 h-5" />
-            </div>
-            <span className="font-bold text-xl tracking-tight text-[#38BDF8]">ActionHost</span>
+    <main className="min-h-screen bg-bg text-text-main p-6 md:p-10">
+      <div className="max-w-7xl mx-auto space-y-8">
+        <header className="flex flex-col md:flex-row md:items-end md:justify-between gap-4">
+          <div>
+            <h1 className="text-3xl font-bold tracking-tight">ActionHost</h1>
+            <p className="text-sm text-text-muted mt-1">Zero-downtime temporary hosting on GitHub Actions with Supabase + Cloudflare orchestration.</p>
           </div>
-          <button 
-            onClick={() => setIsSidebarOpen(false)}
-            className="md:hidden text-[#94A3B8] hover:text-white"
-          >
-            <X className="w-6 h-6" />
-          </button>
-        </div>
-        
-        <nav className="flex-grow px-3 space-y-1">
-          <button 
-            onClick={() => { setActiveTab("dashboard"); setSelectedProject(null); setIsSidebarOpen(false); }}
-            className={cn(
-              "w-full flex items-center gap-3 px-4 py-3 rounded-md transition-all duration-200 text-sm font-medium",
-              activeTab === "dashboard" ? "bg-sidebar-hover text-white border-r-4 border-primary" : "text-[#94A3B8] hover:bg-sidebar-hover hover:text-white"
-            )}
-          >
-            <Activity className="w-4 h-4" />
-            <span>Dashboard</span>
-          </button>
-          
-          <button 
-            onClick={() => { setActiveTab("settings"); setIsSidebarOpen(false); }}
-            className={cn(
-              "w-full flex items-center gap-3 px-4 py-3 rounded-md transition-all duration-200 text-sm font-medium",
-              activeTab === "settings" ? "bg-sidebar-hover text-white border-r-4 border-primary" : "text-[#94A3B8] hover:bg-sidebar-hover hover:text-white"
-            )}
-          >
-            <SettingsIcon className="w-4 h-4" />
-            <span>Settings</span>
-          </button>
-        </nav>
-
-        <div className="p-4 border-t border-sidebar-hover">
-          <div className="flex items-center gap-3 p-2">
-            <div className="w-8 h-8 bg-sidebar-hover rounded-full flex items-center justify-center text-xs font-bold text-white">A</div>
-            <div className="flex flex-col">
-              <span className="text-xs font-bold text-white">Admin</span>
-              <span className="text-[10px] text-[#94A3B8]">Pro Plan</span>
-            </div>
-          </div>
-        </div>
-      </aside>
-
-      {/* Main Content */}
-      <main className="md:pl-60 min-h-screen flex flex-col">
-        <header className="h-16 bg-white border-b border-border flex items-center justify-between px-4 md:px-8 sticky top-0 z-40">
-          <div className="flex items-center gap-3">
-            <button 
-              onClick={() => setIsSidebarOpen(true)}
-              className="md:hidden p-2 hover:bg-bg rounded-md"
-            >
-              <Menu className="w-6 h-6 text-text-main" />
-            </button>
-            <div className="flex items-center gap-2 text-sm text-text-muted">
-              <span className="font-semibold hidden sm:inline">Project:</span>
-              <span className="text-primary font-bold capitalize truncate max-w-[120px] sm:max-w-none">
-                {selectedProject ? selectedProject.name : activeTab}
-              </span>
-            </div>
-          </div>
-          
-          <div className="flex items-center gap-4">
-            <button 
-              onClick={() => setActiveTab("new")}
-              className="bg-primary text-white px-3 py-1.5 md:px-4 md:py-2 rounded-md flex items-center gap-2 text-xs md:text-sm font-semibold hover:opacity-90 transition-all shadow-sm"
-            >
-              <Plus className="w-4 h-4" />
-              <span className="hidden sm:inline">New Project</span>
-              <span className="sm:hidden">New</span>
-            </button>
+          <div className="flex flex-wrap gap-2">
+            {(['dashboard', 'deploy', 'settings'] as Tab[]).map((nextTab) => (
+              <button
+                key={nextTab}
+                onClick={() => {
+                  setSelectedProject(null);
+                  setTab(nextTab);
+                }}
+                className={cn('px-4 py-2 text-sm rounded-lg border transition', tab === nextTab ? 'bg-primary text-white border-primary' : 'bg-white border-border')}
+              >
+                {nextTab[0].toUpperCase() + nextTab.slice(1)}
+              </button>
+            ))}
           </div>
         </header>
 
-        <div className="p-4 md:p-8 flex-grow">
-          <AnimatePresence mode="wait">
-            {activeTab === "dashboard" && !selectedProject && (
-              <motion.div 
-                key="dashboard"
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -10 }}
-                className="space-y-6"
-              >
-                <div className="flex items-end justify-between">
-                  <div>
-                    <h1 className="text-3xl font-bold tracking-tight text-text-main">Projects</h1>
-                    <p className="text-text-muted mt-1">Manage your temporary deployments</p>
-                  </div>
-                </div>
+        {error && <p className="rounded-lg border border-red-200 bg-red-50 p-3 text-sm text-red-700">{error}</p>}
+        {success && <p className="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-700">{success}</p>}
 
-                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                  {projects.map((project) => (
-                    <ProjectCard 
-                      key={project.id} 
-                      project={project} 
-                      onClick={() => setSelectedProject(project)}
-                    />
-                  ))}
-                </div>
-              </motion.div>
-            )}
+        {!selectedProject && tab === 'dashboard' && (
+          <section className="space-y-5">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <StatCard title="Projects" value={String(stats.total)} />
+              <StatCard title="Active" value={String(stats.active)} />
+              <StatCard title="Queued" value={String(stats.queued)} />
+            </div>
 
-            {activeTab === "new" && (
-              <motion.div 
-                key="new"
-                initial={{ opacity: 0, scale: 0.98 }}
-                animate={{ opacity: 1, scale: 1 }}
-                exit={{ opacity: 0, scale: 0.98 }}
-                className="max-w-3xl mx-auto"
-              >
-                <div className="bg-card-bg p-6 sm:p-8 rounded-lg border border-border shadow-sm space-y-6">
-                  <div>
-                    <h2 className="text-sm font-bold uppercase tracking-wider text-text-muted mb-4">New Deployment</h2>
-                    <p className="text-sm text-text-muted mb-6">Connect your GitHub repository and set up Cloudflare</p>
-                  </div>
-                  
-                  <div className="space-y-4">
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                      <div className="space-y-1">
-                        <label className="text-[10px] font-bold uppercase text-text-muted flex items-center gap-2">
-                          <Github className="w-3 h-3" />
-                          GitHub Repository URL
-                        </label>
-                        <input 
-                          type="text" 
-                          value={repoUrl}
-                          onChange={(e) => setRepoUrl(e.target.value)}
-                          placeholder="https://github.com/username/repo"
-                          className="w-full px-3 py-2 rounded-md border border-border focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all text-sm"
-                        />
-                      </div>
-
-                      <div className="space-y-1">
-                        <label className="text-[10px] font-bold uppercase text-text-muted flex items-center gap-2">
-                          <Globe className="w-3 h-3" />
-                          Custom Domain
-                        </label>
-                        <input 
-                          type="text" 
-                          value={domain}
-                          onChange={(e) => setDomain(e.target.value)}
-                          placeholder="example.com"
-                          className="w-full px-3 py-2 rounded-md border border-border focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all text-sm"
-                        />
-                      </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
+              {projects.map((project) => (
+                <motion.button
+                  whileHover={{ y: -2 }}
+                  key={project.id}
+                  onClick={() => setSelectedProject(project)}
+                  className="bg-card-bg rounded-xl border border-border p-5 text-left"
+                >
+                  <div className="flex justify-between items-start gap-3">
+                    <div>
+                      <h3 className="font-semibold text-lg">{project.name}</h3>
+                      <p className="text-xs text-text-muted break-all">{project.repo_url}</p>
                     </div>
-
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-                      <div className="space-y-1">
-                        <label className="text-[10px] font-bold uppercase text-text-muted flex items-center gap-2">
-                          <Shield className="w-3 h-3" />
-                          Cloudflare API Token
-                        </label>
-                        <input 
-                          type="password" 
-                          value={cloudflareToken}
-                          onChange={(e) => setCloudflareToken(e.target.value)}
-                          placeholder="cf_********************"
-                          className="w-full px-3 py-2 rounded-md border border-border focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all text-sm"
-                        />
-                      </div>
-                      <div className="space-y-1">
-                        <label className="text-[10px] font-bold uppercase text-text-muted flex items-center gap-2">
-                          <Github className="w-3 h-3" />
-                          GitHub PAT
-                        </label>
-                        <input 
-                          type="password" 
-                          value={githubPat}
-                          onChange={(e) => setGithubPat(e.target.value)}
-                          placeholder="ghp_********************"
-                          className="w-full px-3 py-2 rounded-md border border-border focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all text-sm"
-                        />
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                      <div className="space-y-1">
-                        <label className="text-[10px] font-bold uppercase text-text-muted flex items-center gap-2">
-                          <Shield className="w-3 h-3" />
-                          Cloudflare Zone ID
-                        </label>
-                        <input 
-                          type="text" 
-                          value={zoneId}
-                          onChange={(e) => setZoneId(e.target.value)}
-                          placeholder="zone_id_here"
-                          className="w-full px-3 py-2 rounded-md border border-border focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all text-sm"
-                        />
-                      </div>
-                      <div className="space-y-1">
-                        <label className="text-[10px] font-bold uppercase text-text-muted">Subdomain (Optional)</label>
-                        <input 
-                          type="text" 
-                          value={subdomain}
-                          onChange={(e) => setSubdomain(e.target.value)}
-                          placeholder="app"
-                          className="w-full px-3 py-2 rounded-md border border-border focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all text-sm"
-                        />
-                      </div>
-                      <div className="flex items-end">
-                        {!analysis ? (
-                          <button 
-                            onClick={handleAnalyze}
-                            disabled={loading || !repoUrl}
-                            className="w-full bg-primary text-white py-2 rounded-md font-semibold hover:opacity-90 transition-all shadow-sm flex items-center justify-center gap-2 disabled:opacity-50 text-sm"
-                          >
-                            {loading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Activity className="w-4 h-4" />}
-                            Analyze Repo
-                          </button>
-                        ) : (
-                          <button 
-                            onClick={handleDeploy}
-                            disabled={loading}
-                            className="w-full bg-success text-white py-2 rounded-md font-semibold hover:opacity-90 transition-all shadow-sm flex items-center justify-center gap-2 text-sm"
-                          >
-                            {loading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />}
-                            Deploy Now
-                          </button>
-                        )}
-                      </div>
-                    </div>
-
-                    {analysis && (
-                      <motion.div 
-                        initial={{ opacity: 0, height: 0 }}
-                        animate={{ opacity: 1, height: "auto" }}
-                        className="p-4 bg-bg rounded-md border border-border space-y-2"
-                      >
-                        <h4 className="text-[10px] font-bold uppercase text-text-muted">AI Analysis Result</h4>
-                        <div className="grid grid-cols-2 gap-2 text-xs">
-                          <div>
-                            <span className="text-text-muted">Framework:</span>
-                            <span className="ml-2 font-bold text-text-main">{analysis.framework}</span>
-                          </div>
-                          <div>
-                            <span className="text-text-muted">Branch:</span>
-                            <span className="ml-2 font-bold text-text-main">{analysis.branch}</span>
-                          </div>
-                        </div>
-                      </motion.div>
-                    )}
+                    <StatusBadge status={project.deployments?.[0]?.status ?? 'queued'} />
                   </div>
-                </div>
-              </motion.div>
-            )}
 
-            {activeTab === "settings" && (
-              <motion.div 
-                key="settings"
-                initial={{ opacity: 0, x: 20 }}
-                animate={{ opacity: 1, x: 0 }}
-                exit={{ opacity: 0, x: -20 }}
-                className="max-w-3xl mx-auto space-y-8"
-              >
-                <div>
-                  <h2 className="text-3xl font-bold text-text-main">Settings</h2>
-                  <p className="text-text-muted">Manage your Cerebras API keys and rotation</p>
-                </div>
-
-                <div className="bg-card-bg rounded-lg border border-border overflow-hidden shadow-sm">
-                  <div className="p-6 border-b border-border">
-                    <h3 className="text-sm font-bold uppercase tracking-wider text-text-muted">Cerebras API Keys</h3>
-                    <p className="text-xs text-text-muted mt-1">Add multiple keys for automatic rotation and usage tracking.</p>
+                  <div className="mt-4 text-xs text-text-muted space-y-1">
+                    <p className="flex items-center gap-2"><Globe className="w-3.5 h-3.5" /> {project.subdomain ? `${project.subdomain}.` : ''}{project.domain}</p>
+                    <p className="flex items-center gap-2"><Github className="w-3.5 h-3.5" /> {project.framework ?? 'Auto-detected'}</p>
                   </div>
-                  <div className="p-6 space-y-6">
-                    <div className="flex gap-4">
-                      <input 
-                        type="password" 
-                        value={newCerebrasKey}
-                        onChange={(e) => setNewCerebrasKey(e.target.value)}
-                        placeholder="c_********************"
-                        className="flex-grow px-3 py-2 rounded-md border border-border focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary text-sm"
-                      />
-                      <button 
-                        onClick={handleAddCerebrasKey}
-                        className="bg-primary text-white px-6 py-2 rounded-md font-semibold hover:opacity-90 transition-all shadow-sm text-sm"
-                      >
-                        Add Key
-                      </button>
-                    </div>
+                </motion.button>
+              ))}
+            </div>
+          </section>
+        )}
 
-                    <div className="space-y-3">
-                      {cerebrasKeys.map((key) => (
-                        <div key={key.id} className="flex items-center justify-between p-4 bg-bg rounded-md border border-border">
-                          <div className="flex flex-col">
-                            <span className="text-xs font-mono text-text-main">
-                              {key.key.substring(0, 4)}...{key.key.substring(key.key.length - 4)}
-                            </span>
-                            <span className="text-[10px] text-text-muted uppercase font-bold mt-1">
-                              Usages: {key.usage_count}
-                            </span>
-                          </div>
-                          <button 
-                            onClick={() => handleDeleteCerebrasKey(key.id)}
-                            className="text-xs text-red-500 hover:text-red-700 font-bold uppercase tracking-wider"
-                          >
-                            Delete
-                          </button>
-                        </div>
-                      ))}
-                      {cerebrasKeys.length === 0 && (
-                        <div className="text-center py-8 border-2 border-dashed border-border rounded-md">
-                          <p className="text-sm text-text-muted">No keys added yet.</p>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                </div>
-              </motion.div>
-            )}
+        {tab === 'deploy' && !selectedProject && (
+          <section className="max-w-4xl rounded-xl bg-card-bg border border-border p-6 space-y-5">
+            <h2 className="text-xl font-bold flex items-center gap-2"><Activity className="w-5 h-5" /> New deployment</h2>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <Input label="GitHub repository URL" value={form.repoUrl} onChange={(value) => setForm((prev) => ({ ...prev, repoUrl: value }))} placeholder="https://github.com/owner/repo" />
+              <Input label="Cloudflare API token" type="password" value={form.cloudflareApiToken} onChange={(value) => setForm((prev) => ({ ...prev, cloudflareApiToken: value }))} />
+              <Input label="Cloudflare Zone ID" value={form.cloudflareZoneId} onChange={(value) => setForm((prev) => ({ ...prev, cloudflareZoneId: value }))} />
+              <Input label="Custom domain" value={form.domain} onChange={(value) => setForm((prev) => ({ ...prev, domain: value }))} placeholder="example.com" />
+              <Input label="Subdomain (optional)" value={form.subdomain ?? ''} onChange={(value) => setForm((prev) => ({ ...prev, subdomain: value }))} placeholder="app" />
+            </div>
+            <button onClick={handleDeploy} disabled={deploying} className="bg-primary text-white px-5 py-2 rounded-lg text-sm font-semibold inline-flex items-center gap-2 disabled:opacity-50">
+              {deploying ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Activity className="w-4 h-4" />} Deploy now
+            </button>
+          </section>
+        )}
 
-            {selectedProject && (
-              <ProjectDetail 
-                project={selectedProject} 
-                onBack={() => setSelectedProject(null)} 
-              />
-            )}
-          </AnimatePresence>
+        {tab === 'settings' && !selectedProject && (
+          <section className="max-w-2xl rounded-xl bg-card-bg border border-border p-6 space-y-4">
+            <h2 className="text-xl font-bold flex items-center gap-2"><Settings className="w-5 h-5" /> Settings</h2>
+            <Input label="Optional Cerebras API key (stored backend-only)" value={cerebrasKey} type="password" onChange={setCerebrasKey} />
+            <button onClick={saveSettings} className="bg-primary text-white px-5 py-2 rounded-lg text-sm font-semibold">Save settings</button>
+          </section>
+        )}
+
+        {selectedProject && <ProjectDetails projectId={selectedProject.id} onBack={() => setSelectedProject(null)} />}
+      </div>
+    </main>
+  );
+}
+
+function ProjectDetails({ projectId, onBack }: { projectId: string; onBack: () => void }) {
+  const [project, setProject] = useState<Project | null>(null);
+  const [deployments, setDeployments] = useState<Deployment[]>([]);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+
+  useEffect(() => {
+    if (!supabase) return;
+
+    const load = async () => {
+      const { data: projectRow } = await supabase.from('projects').select('*').eq('id', projectId).single();
+      const { data: depRows } = await supabase.from('deployments').select('*').eq('project_id', projectId).order('created_at', { ascending: false });
+      setProject(projectRow as Project);
+      setDeployments((depRows ?? []) as Deployment[]);
+
+      if (depRows?.length) {
+        const { data: logsRows } = await supabase.from('logs').select('*').eq('deployment_id', depRows[0].id).order('created_at', { ascending: true });
+        setLogs((logsRows ?? []) as LogEntry[]);
+      }
+    };
+
+    load();
+    const channel = supabase
+      .channel(`project-live-${projectId}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'deployments', filter: `project_id=eq.${projectId}` }, load)
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'logs' }, load)
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, [projectId]);
+
+  const latest = deployments[0];
+
+  return (
+    <section className="space-y-4">
+      <button onClick={onBack} className="text-sm text-text-muted">← Back to dashboard</button>
+
+      <div className="rounded-xl bg-card-bg border border-border p-6 space-y-4">
+        <h2 className="text-2xl font-bold">{project?.name ?? 'Project'}</h2>
+        <p className="text-xs text-text-muted break-all">{project?.repo_url}</p>
+
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-sm">
+          <InfoCard label="Status" value={latest ? <StatusBadge status={latest.status} /> : 'No deployments'} />
+          <InfoCard label="Created" value={latest ? new Date(latest.created_at).toLocaleString() : '—'} />
+          <InfoCard
+            label="Live URL"
+            value={
+              latest?.public_url ? (
+                <a href={latest.public_url} target="_blank" rel="noreferrer" className="text-primary inline-flex items-center gap-1">
+                  Open <ExternalLink className="w-3 h-3" />
+                </a>
+              ) : (
+                'Pending'
+              )
+            }
+          />
         </div>
-      </main>
+      </div>
+
+      <div className="rounded-xl bg-sidebar-bg p-5 h-72 overflow-y-auto">
+        <h3 className="text-xs text-white uppercase font-bold tracking-wider">Deployment logs</h3>
+        <div className="mt-4 space-y-2 text-xs text-slate-300 font-mono">
+          {logs.length === 0 && <p>No logs yet.</p>}
+          {logs.map((entry) => (
+            <p key={entry.id}>
+              <span className="text-slate-500 mr-2">[{new Date(entry.created_at).toLocaleTimeString()}]</span>
+              {entry.message}
+            </p>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function Input({ label, value, onChange, placeholder, type = 'text' }: { label: string; value: string; onChange: (value: string) => void; placeholder?: string; type?: string }) {
+  return (
+    <label className="space-y-1 block">
+      <span className="text-xs uppercase font-bold text-text-muted">{label}</span>
+      <input
+        type={type}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        placeholder={placeholder}
+        className="w-full rounded-lg border border-border px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
+      />
+    </label>
+  );
+}
+
+function InfoCard({ label, value }: { label: string; value: ReactNode }) {
+  return (
+    <div className="p-3 border border-border rounded-lg">
+      <p className="text-[10px] font-bold uppercase text-text-muted">{label}</p>
+      <div className="text-sm mt-1">{value}</div>
     </div>
   );
 }
 
-function ProjectCard({ project, onClick }: { project: Project, onClick: () => void, key?: React.Key }) {
-  return (
-    <motion.div 
-      whileHover={{ y: -4 }}
-      onClick={onClick}
-      className="bg-card-bg p-6 rounded-lg border border-border shadow-sm hover:shadow-md transition-all cursor-pointer group"
-    >
-      <div className="flex items-start justify-between mb-4">
-        <div className="w-10 h-10 bg-bg rounded-lg flex items-center justify-center group-hover:bg-primary transition-colors">
-          <Github className="w-5 h-5 text-text-muted group-hover:text-white transition-colors" />
-        </div>
-        <StatusBadge status="active" />
-      </div>
-      
-      <h3 className="font-bold text-lg mb-1 text-text-main">{project.name}</h3>
-      <p className="text-xs text-text-muted font-mono mb-4 truncate">{project.repo_url}</p>
-      
-      <div className="flex items-center gap-2 text-xs text-text-muted font-medium">
-        <Globe className="w-3 h-3" />
-        <span>{project.subdomain ? `${project.subdomain}.` : ""}{project.domain}</span>
-      </div>
-    </motion.div>
-  );
-}
-
 function StatusBadge({ status }: { status: ProjectStatus }) {
-  const styles = {
-    active: "bg-[#DCFCE7] text-[#166534] border-[#BBF7D0]",
-    starting: "bg-blue-50 text-blue-700 border-blue-100",
-    failed: "bg-red-50 text-red-700 border-red-100",
-    queued: "bg-slate-50 text-slate-700 border-slate-100",
-    warming: "bg-[#FEF3C7] text-[#92400E] border-[#FDE68A]",
-    ready: "bg-indigo-50 text-indigo-700 border-indigo-100",
-    draining: "bg-orange-50 text-orange-700 border-orange-100",
-    stopped: "bg-slate-50 text-slate-700 border-slate-100",
-  };
-
-  return (
-    <span className={cn(
-      "px-3 py-1 rounded-full text-[10px] font-bold uppercase tracking-wider border",
-      styles[status]
-    )}>
-      {status}
-    </span>
-  );
+  return <span className={cn('px-2 py-1 rounded-full border text-[10px] uppercase font-bold', STATUS_STYLES[status])}>{status}</span>;
 }
 
-function ProjectDetail({ project, onBack }: { project: Project, onBack: () => void }) {
-  const [deployments, setDeployments] = useState<Deployment[]>([]);
-  const [activeDeployment, setActiveDeployment] = useState<Deployment | null>(null);
-
-  useEffect(() => {
-    if (!supabase) return;
-    fetchDeployments();
-    const sub = supabase
-      .channel(`project-${project.id}`)
-      .on('postgres_changes', { event: '*', schema: 'public', table: 'deployments', filter: `project_id=eq.${project.id}` }, fetchDeployments)
-      .subscribe();
-    return () => { supabase.removeChannel(sub); };
-  }, [project.id]);
-
-  const fetchDeployments = async () => {
-    if (!supabase) return;
-    const { data } = await supabase
-      .from("deployments")
-      .select("*")
-      .eq("project_id", project.id)
-      .order("created_at", { ascending: false });
-    
-    if (data) {
-      setDeployments(data);
-      setActiveDeployment(data.find(d => d.status === "active") || data[0] || null);
-    }
-  };
-
-  const handleRedeploy = async () => {
-    await fetch("/api/deploy", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        projectId: project.id,
-        repoUrl: project.repo_url,
-        buildCommand: project.build_command,
-        startCommand: project.start_command
-      })
-    });
-  };
-
+function StatCard({ title, value }: { title: string; value: string }) {
   return (
-    <motion.div 
-      initial={{ opacity: 0, x: 20 }}
-      animate={{ opacity: 1, x: 0 }}
-      exit={{ opacity: 0, x: -20 }}
-      className="space-y-8"
-    >
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div>
-          <button onClick={onBack} className="text-sm text-text-muted hover:text-text-main mb-2 flex items-center gap-1 transition-colors">
-            <ChevronRight className="w-4 h-4 rotate-180" />
-            Back to Dashboard
-          </button>
-          <h1 className="text-2xl sm:text-3xl font-bold text-text-main">{project.name}</h1>
-        </div>
-        <div className="flex gap-3">
-          <button 
-            onClick={handleRedeploy}
-            className="flex-1 sm:flex-none px-4 py-2 rounded-md border border-border font-semibold hover:bg-white transition-all flex items-center justify-center gap-2 text-sm text-text-main"
-          >
-            <RefreshCw className="w-4 h-4" />
-            Redeploy
-          </button>
-          {activeDeployment?.public_url && (
-            <a 
-              href={activeDeployment.public_url} 
-              target="_blank" 
-              rel="noreferrer"
-              className="flex-1 sm:flex-none px-4 py-2 rounded-md bg-primary text-white font-semibold hover:opacity-90 transition-all flex items-center justify-center gap-2 text-sm shadow-sm"
-            >
-              <ExternalLink className="w-4 h-4" />
-              Visit Site
-            </a>
-          )}
-        </div>
-      </div>
-
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-        <div className="lg:col-span-2 space-y-8">
-          {/* Active Deployment */}
-          <div className="bg-card-bg rounded-lg border border-border overflow-hidden shadow-sm">
-            <div className="p-6 border-b border-border flex items-center justify-between">
-              <h3 className="text-sm font-bold uppercase tracking-wider text-text-muted flex items-center gap-2">
-                <Activity className="w-4 h-4" />
-                {activeDeployment?.status === "active" ? "Active Deployment" : "Latest Deployment"}
-              </h3>
-              {activeDeployment && <StatusBadge status={activeDeployment.status} />}
-            </div>
-            <div className="p-6 space-y-4">
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div className="p-4 bg-bg rounded-md border border-border">
-                  <span className="text-[10px] uppercase font-bold text-text-muted block mb-1">Public URL</span>
-                  <span className="text-sm font-mono truncate block text-text-main">
-                    {activeDeployment?.public_url || "Waiting for tunnel..."}
-                  </span>
-                </div>
-                <div className="p-4 bg-bg rounded-md border border-border">
-                  <span className="text-[10px] uppercase font-bold text-text-muted block mb-1">Created At</span>
-                  <span className="text-sm font-bold flex items-center gap-2 text-text-main">
-                    <Clock className="w-4 h-4 text-text-muted" />
-                    {activeDeployment ? new Date(activeDeployment.created_at).toLocaleString() : "N/A"}
-                  </span>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          {/* Logs */}
-          <div className="bg-sidebar-bg rounded-lg overflow-hidden shadow-xl">
-            <div className="p-4 border-b border-sidebar-hover flex items-center justify-between">
-              <div className="flex items-center gap-2">
-                <Terminal className="w-4 h-4 text-[#38BDF8]" />
-                <span className="text-[10px] font-bold text-white uppercase tracking-widest">Deployment Logs</span>
-              </div>
-              <div className="flex gap-2">
-                <div className="w-2 h-2 rounded-full bg-red-500/50" />
-                <div className="w-2 h-2 rounded-full bg-yellow-500/50" />
-                <div className="w-2 h-2 rounded-full bg-green-500/50" />
-              </div>
-            </div>
-            <div className="p-6 h-80 overflow-y-auto font-mono text-[11px] space-y-2 text-[#94A3B8]">
-              <p><span className="text-[#475569] mr-2">[15:41:12]</span> <span className="text-[#38BDF8] mr-2">[SYS]</span> Initializing deployment workflow...</p>
-              <p><span className="text-[#475569] mr-2">[15:41:15]</span> <span className="text-[#38BDF8] mr-2">[GIT]</span> Cloning repository: {project.repo_url}</p>
-              <p><span className="text-[#475569] mr-2">[15:41:20]</span> <span className="text-[#38BDF8] mr-2">[AI]</span> Detecting framework: {project.framework}</p>
-              <p><span className="text-[#475569] mr-2">[15:41:25]</span> <span className="text-[#38BDF8] mr-2">[BUILD]</span> Running build command: {project.build_command || 'npm run build'}</p>
-              <p><span className="text-[#475569] mr-2">[15:42:10]</span> <span className="text-success mr-2">[SUCCESS]</span> Build successful. Starting application...</p>
-              <p><span className="text-[#475569] mr-2">[15:42:15]</span> <span className="text-warning mr-2">[WARM]</span> Warming up deployment...</p>
-              <p><span className="text-[#475569] mr-2">[15:42:30]</span> <span className="text-success mr-2">[HEALTH]</span> Health check passed. Switching DNS...</p>
-              <p className="text-white font-bold tracking-widest mt-4 border-t border-sidebar-hover pt-4">--- DEPLOYMENT READY ---</p>
-            </div>
-          </div>
-        </div>
-
-        <div className="space-y-6">
-          <div className="bg-card-bg p-6 rounded-lg border border-border space-y-4 shadow-sm">
-            <h3 className="text-[10px] font-bold uppercase tracking-wider text-text-muted">Project Details</h3>
-            <div className="space-y-3">
-              <div className="flex justify-between text-sm">
-                <span className="text-text-muted">Framework</span>
-                <span className="font-bold text-text-main">{project.framework}</span>
-              </div>
-              <div className="flex justify-between text-sm">
-                <span className="text-text-muted">Branch</span>
-                <span className="font-bold text-text-main">main</span>
-              </div>
-              <div className="flex justify-between text-sm">
-                <span className="text-text-muted">Region</span>
-                <span className="font-bold text-text-main">GitHub Actions</span>
-              </div>
-            </div>
-          </div>
-
-          <div className="bg-card-bg p-6 rounded-lg border border-border space-y-4 shadow-sm">
-            <h3 className="text-[10px] font-bold uppercase tracking-wider text-text-muted">Domain Config</h3>
-            <div className="space-y-3">
-              <div className="p-3 bg-bg rounded-md border border-border">
-                <span className="text-[10px] font-bold text-text-muted block uppercase mb-1">Cloudflare Zone</span>
-                <span className="text-xs font-mono text-text-main break-all">{project.cloudflare_zone_id}</span>
-              </div>
-              <div className="p-3 bg-bg rounded-md border border-border">
-                <span className="text-[10px] font-bold text-text-muted block uppercase mb-1">Target Domain</span>
-                <span className="text-xs font-bold text-primary">{project.subdomain ? `${project.subdomain}.` : ""}{project.domain}</span>
-              </div>
-            </div>
-          </div>
-
-          <div className="bg-card-bg p-6 rounded-lg border border-border space-y-4 shadow-sm">
-            <h3 className="text-[10px] font-bold uppercase tracking-wider text-text-muted">Upcoming Rotation</h3>
-            <div className="space-y-4">
-              <div className="flex justify-between items-center py-2 border-b border-border last:border-0">
-                <div>
-                  <div className="text-xs font-bold text-text-main">next-rotation-v2</div>
-                  <div className="text-[10px] text-text-muted">Queue: 14:40</div>
-                </div>
-                <StatusBadge status="warming" />
-              </div>
-              <div className="flex justify-between items-center py-2 border-b border-border last:border-0">
-                <div>
-                  <div className="text-xs font-bold text-text-main">manual-patch</div>
-                  <div className="text-[10px] text-text-muted">Draft</div>
-                </div>
-                <StatusBadge status="queued" />
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </motion.div>
+    <div className="rounded-xl border border-border bg-card-bg p-4">
+      <p className="text-xs uppercase font-bold text-text-muted">{title}</p>
+      <p className="text-2xl font-bold mt-2">{value}</p>
+    </div>
   );
 }
