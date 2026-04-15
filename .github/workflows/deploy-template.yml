@@ -1,0 +1,97 @@
+name: ActionHost Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo_url:
+        description: 'Repository URL to deploy'
+        required: true
+      project_id:
+        description: 'ActionHost Project ID'
+        required: true
+      deployment_id:
+        description: 'ActionHost Deployment ID'
+        required: true
+      build_command:
+        description: 'Command to build the app'
+        required: false
+        default: 'npm run build'
+      start_command:
+        description: 'Command to start the app'
+        required: false
+        default: 'npm start'
+      supabase_url:
+        description: 'Supabase URL'
+        required: true
+      supabase_key:
+        description: 'Supabase Service Key'
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Target Repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.inputs.repo_url }}
+          path: target-app
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Dependencies
+        run: |
+          cd target-app
+          npm install
+
+      - name: Build Application
+        run: |
+          cd target-app
+          ${{ github.event.inputs.build_command }}
+
+      - name: Install Cloudflared
+        run: |
+          curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i cloudflared.deb
+
+      - name: Start Application & Tunnel
+        env:
+          SUPABASE_URL: ${{ github.event.inputs.supabase_url }}
+          SUPABASE_KEY: ${{ github.event.inputs.supabase_key }}
+        run: |
+          cd target-app
+          # Start app in background
+          ${{ github.event.inputs.start_command }} &
+          APP_PID=$!
+          
+          # Wait for app to be ready (simple check)
+          sleep 10
+          
+          # Start cloudflared tunnel
+          # Note: In a real scenario, we'd use a pre-configured tunnel or a quick tunnel
+          # For this demo/pro product, we'll use a quick tunnel and capture the URL
+          cloudflared tunnel --url http://localhost:3000 > tunnel.log 2>&1 &
+          TUNNEL_PID=$!
+          
+          # Extract URL from log
+          sleep 5
+          TUNNEL_URL=$(grep -o 'https://.*\.trycloudflare\.com' tunnel.log | head -n 1)
+          
+          echo "Tunnel URL: $TUNNEL_URL"
+          
+          # Update Supabase with the URL and status
+          curl -X PATCH "${SUPABASE_URL}/rest/v1/deployments?id=eq.${{ github.event.inputs.deployment_id }}" \
+            -H "apikey: ${SUPABASE_KEY}" \
+            -H "Authorization: Bearer ${SUPABASE_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "{\"public_url\": \"$TUNNEL_URL\", \"status\": \"active\"}"
+
+          # Keep running for 4 hours
+          sleep 14400
+          
+          # Cleanup
+          kill $APP_PID
+          kill $TUNNEL_PID
