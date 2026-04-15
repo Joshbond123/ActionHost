@@ -1,74 +1,91 @@
 # ActionHost
 
-Deploy any GitHub repository as a temporary host using GitHub Actions with zero-downtime rotation and Cloudflare integration.
+ActionHost is a deployment control dashboard that stores deployment state in Supabase and is hosted on **GitHub Pages**.
 
-## Supabase Schema
+## Production architecture
 
-Run the following SQL in your Supabase SQL Editor:
+- **Frontend hosting**: GitHub Pages (`deploy-pages.yml`).
+- **State + realtime**: Supabase tables (`projects`, `deployments`, `logs`, `cerebras_keys`).
+- **Secure automation**: GitHub PAT and Supabase service-role keys are kept only in GitHub Actions repository secrets.
+- **Deployment worker**: `deploy-template.yml` can be triggered to process queued deployments.
+
+## Required GitHub repository secrets
+
+Add these secrets in **Settings → Secrets and variables → Actions**:
+
+- `VITE_SUPABASE_URL`
+- `VITE_SUPABASE_ANON_KEY`
+- `VITE_SUPABASE_FUNCTIONS_BASE_URL` (optional; used for `analyze-repo` and `queue-deployment` edge functions)
+- `SUPABASE_URL` (for deployment worker)
+- `SUPABASE_SERVICE_ROLE_KEY` (for deployment worker)
+- `GITHUB_PAT` (used by workflows only)
+
+> Never put `GITHUB_PAT` in frontend code or client-exposed environment variables.
+
+## Supabase schema
 
 ```sql
--- Projects Table
-CREATE TABLE projects (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  name TEXT NOT NULL,
-  repo_url TEXT NOT NULL,
-  cloudflare_zone_id TEXT NOT NULL,
-  cloudflare_api_token TEXT NOT NULL,
-  github_pat TEXT NOT NULL,
-  domain TEXT NOT NULL,
-  subdomain TEXT,
-  framework TEXT,
-  build_command TEXT,
-  start_command TEXT,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+create extension if not exists "uuid-ossp";
+
+create table if not exists projects (
+  id uuid primary key default uuid_generate_v4(),
+  name text not null,
+  repo_url text not null,
+  domain text not null,
+  subdomain text,
+  cloudflare_zone_id text,
+  framework text,
+  build_command text,
+  start_command text,
+  created_at timestamptz default now()
 );
 
--- Cerebras Keys Table
-CREATE TABLE cerebras_keys (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  key TEXT NOT NULL UNIQUE,
-  usage_count INTEGER DEFAULT 0,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+create table if not exists deployments (
+  id uuid primary key default uuid_generate_v4(),
+  project_id uuid references projects(id) on delete cascade,
+  status text not null default 'queued',
+  workflow_run_id text,
+  public_url text,
+  created_at timestamptz default now(),
+  expires_at timestamptz
 );
 
--- Deployments Table
-CREATE TABLE deployments (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  project_id UUID REFERENCES projects(id) ON DELETE CASCADE,
-  status TEXT NOT NULL DEFAULT 'queued',
-  workflow_run_id TEXT,
-  public_url TEXT,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  expires_at TIMESTAMP WITH TIME ZONE
+create table if not exists logs (
+  id uuid primary key default uuid_generate_v4(),
+  deployment_id uuid references deployments(id) on delete cascade,
+  message text not null,
+  level text default 'info',
+  created_at timestamptz default now()
 );
 
--- Logs Table
-CREATE TABLE logs (
-  id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  deployment_id UUID REFERENCES deployments(id) ON DELETE CASCADE,
-  message TEXT NOT NULL,
-  level TEXT DEFAULT 'info',
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+create table if not exists cerebras_keys (
+  id uuid primary key default uuid_generate_v4(),
+  key text not null unique,
+  usage_count integer default 0,
+  created_at timestamptz default now()
 );
 
--- Enable Realtime
-ALTER PUBLICATION supabase_realtime ADD TABLE projects;
-ALTER PUBLICATION supabase_realtime ADD TABLE deployments;
-ALTER PUBLICATION supabase_realtime ADD TABLE logs;
+alter publication supabase_realtime add table projects;
+alter publication supabase_realtime add table deployments;
+alter publication supabase_realtime add table logs;
 ```
 
-## Setup
+## Local development
 
-1.  **GitHub PAT**: Create a Personal Access Token with `repo` and `workflow` scopes.
-2.  **Cloudflare**: Get your API Token (with DNS edit permissions) and Zone ID.
-3.  **Supabase**: Create a new project and get the URL and Service Role Key.
-4.  **Environment Variables**: Update your `.env` file with the keys above.
-5.  **GitHub Actions**: Ensure the `deploy-template.yml` is in your repository's `.github/workflows` folder.
+1. Copy `.env.example` to `.env`.
+2. Set:
+   - `VITE_SUPABASE_URL`
+   - `VITE_SUPABASE_ANON_KEY`
+   - optional `VITE_SUPABASE_FUNCTIONS_BASE_URL`
+3. Run:
 
-## How it Works
+```bash
+npm ci
+npm run dev
+```
 
-1.  **Analyze**: Paste a GitHub URL. ActionHost uses Gemini AI to detect the framework and commands.
-2.  **Deploy**: ActionHost triggers a GitHub Action in *this* repo.
-3.  **Host**: The GitHub Action clones the target repo, builds it, and starts it.
-4.  **Expose**: A Cloudflare Tunnel is created to expose the local app to the internet.
-5.  **Rotate**: Every 4 hours, a new deployment is started. Once ready, the Cloudflare DNS is updated to point to the new tunnel URL, ensuring zero downtime.
+## Deploy to GitHub Pages
+
+- Push to `main`.
+- Workflow `Deploy GitHub Pages` runs automatically.
+- Site is published at: `https://<github-username>.github.io/ActionHost/`.

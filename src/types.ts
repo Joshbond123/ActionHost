@@ -1,17 +1,23 @@
-export type ProjectStatus = 'queued' | 'starting' | 'warming' | 'ready' | 'active' | 'draining' | 'stopped' | 'failed';
+export type ProjectStatus =
+  | 'queued'
+  | 'starting'
+  | 'warming'
+  | 'ready'
+  | 'active'
+  | 'draining'
+  | 'stopped'
+  | 'failed';
 
 export interface Project {
   id: string;
   name: string;
   repo_url: string;
-  cloudflare_zone_id: string;
-  cloudflare_api_token: string;
-  github_pat: string;
   domain: string;
-  subdomain?: string;
-  framework?: string;
-  build_command?: string;
-  start_command?: string;
+  subdomain?: string | null;
+  framework?: string | null;
+  build_command?: string | null;
+  start_command?: string | null;
+  cloudflare_zone_id?: string | null;
   created_at: string;
 }
 
@@ -26,10 +32,10 @@ export interface Deployment {
   id: string;
   project_id: string;
   status: ProjectStatus;
-  workflow_run_id?: string;
-  public_url?: string;
+  workflow_run_id?: string | null;
+  public_url?: string | null;
   created_at: string;
-  expires_at?: string;
+  expires_at?: string | null;
 }
 
 export interface Log {
