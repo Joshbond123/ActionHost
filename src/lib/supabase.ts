@@ -1,16 +1,9 @@
 import { createClient } from '@supabase/supabase-js';
 
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL?.trim() ?? '';
-const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY?.trim() ?? '';
+const supabaseUrl = process.env.SUPABASE_URL || '';
+const supabaseAnonKey = process.env.SUPABASE_ANON_KEY || '';
 
-export const hasSupabaseConfig = Boolean(supabaseUrl && supabaseAnonKey);
-
-export const supabase = hasSupabaseConfig
-  ? createClient(supabaseUrl, supabaseAnonKey, {
-      auth: {
-        persistSession: false,
-      },
-    })
-  : null;
-
-export const functionsBaseUrl = import.meta.env.VITE_SUPABASE_FUNCTIONS_BASE_URL?.trim() ?? '';
+// Only create client if URL is provided, otherwise export a proxy or handle it in components
+export const supabase = supabaseUrl 
+  ? createClient(supabaseUrl, supabaseAnonKey)
+  : null as any;
