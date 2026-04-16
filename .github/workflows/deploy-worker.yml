@@ -35,7 +35,9 @@ jobs:
         env:
           PROJECT_ID: ${{ inputs.project_id }}
           DEPLOYMENT_ID: ${{ inputs.deployment_id }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_PAT: ${{ vars.ACTIONHOST_GITHUB_PAT }}
           ACTIONHOST_REPO_PATH: ${{ vars.ACTIONHOST_REPO_PATH }}
           SUPABASE_URL: ${{ vars.ACTIONHOST_SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ vars.ACTIONHOST_SUPABASE_SERVICE_ROLE_KEY }}
+          FREEDOMAIN_DNS_API_BASE: ${{ vars.FREEDOMAIN_DNS_API_BASE }}

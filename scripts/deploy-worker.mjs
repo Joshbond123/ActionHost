@@ -5,110 +5,180 @@ import fs from 'node:fs';
 
 const deploymentId = process.env.DEPLOYMENT_ID;
 const projectId = process.env.PROJECT_ID;
+const workflowRunId = process.env.GITHUB_RUN_ID;
 
 if (!deploymentId || !projectId) throw new Error('DEPLOYMENT_ID and PROJECT_ID are required.');
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+
+const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 const log = async (message, level = 'info') => {
   console.log(message);
   await supabase.from('logs').insert({ deployment_id: deploymentId, message, level });
 };
 
+const updateDeployment = async (payload) => {
+  await supabase.from('deployments').update(payload).eq('id', deploymentId);
+};
+
+const parseDomain = (domain) => {
+  const parts = domain.split('.');
+  if (parts.length < 2) throw new Error(`Invalid domain: ${domain}`);
+  return {
+    root: parts.slice(-2).join('.'),
+    host: parts.length > 2 ? parts.slice(0, -2).join('.') : '@',
+  };
+};
+
+const updateFreeDomainDns = async ({ domain, apiKey, targetHostname }) => {
+  const { root, host } = parseDomain(domain);
+  const apiBase = process.env.FREEDOMAIN_DNS_API_BASE || 'https://update.dnsexit.com/RemoteUpdate.sv';
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const url = `${apiBase}?apikey=${encodeURIComponent(apiKey)}&domain=${encodeURIComponent(root)}&host=${encodeURIComponent(host)}&recordtype=CNAME&target=${encodeURIComponent(targetHostname)}`;
+    const response = await fetch(url, { method: 'GET' });
+    const body = await response.text();
+
+    if (response.ok && !/error|invalid|failed/i.test(body)) {
+      return { ok: true, body };
+    }
+
+    if (attempt < 3) await wait(3000 * attempt);
+  }
+
+  return { ok: false, body: 'DNS update failed after retries' };
+};
+
+const verifyUrlHealthy = async (url) => {
+  for (let attempt = 1; attempt <= 6; attempt++) {
+    try {
+      const response = await fetch(url, { redirect: 'follow' });
+      if (response.ok) return true;
+    } catch {
+      // ignore and retry
+    }
+    await wait(4000);
+  }
+  return false;
+};
+
 const { data: project, error: projectError } = await supabase.from('projects').select('*').eq('id', projectId).single();
 if (projectError) throw projectError;
 
-await supabase.from('deployments').update({ status: 'starting' }).eq('id', deploymentId);
-await log(`Cloning ${project.repo_url}`);
+await updateDeployment({ status: 'starting', workflow_status: 'in_progress', workflow_run_id: workflowRunId || null });
+await log(`Starting deployment for ${project.repo_url}`);
 
 execSync(`git clone ${project.repo_url} target-app`, { stdio: 'inherit' });
-
-const appDir = 'target-app';
-const hasPackageJson = fs.existsSync(`${appDir}/package.json`);
+const hasPackageJson = fs.existsSync('target-app/package.json');
 
 if (hasPackageJson) {
-  await log('Installing npm dependencies');
-  execSync('npm ci', { cwd: appDir, stdio: 'inherit' });
+  await log('Installing dependencies');
+  execSync('npm ci', { cwd: 'target-app', stdio: 'inherit' });
 }
 
-await log(`Running build command: ${project.build_command || 'npm run build'}`);
-execSync(project.build_command || 'npm run build', { cwd: appDir, stdio: 'inherit' });
+await log(`Running build command: ${project.detected_build_command || 'npm run build'}`);
+execSync(project.detected_build_command || 'npm run build', { cwd: 'target-app', stdio: 'inherit', shell: '/bin/bash' });
 
-await log('Starting temporary Cloudflare quick tunnel');
+await log(`Running start command: ${project.detected_start_command || 'npm run preview -- --host 0.0.0.0 --port 4173'}`);
+execSync(`${project.detected_start_command || 'npm run preview -- --host 0.0.0.0 --port 4173'} > ../app.log 2>&1 &`, {
+  cwd: 'target-app',
+  stdio: 'inherit',
+  shell: '/bin/bash',
+});
+
+await log('Starting Cloudflare Quick Tunnel');
 execSync('curl -L --output cloudflared.tgz https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.tgz', { stdio: 'inherit' });
 execSync('tar -xzf cloudflared.tgz cloudflared && chmod +x cloudflared');
-
-const startCommand = project.start_command || 'npm run preview -- --host 0.0.0.0 --port 4173';
-execSync(`${startCommand} > ../app.log 2>&1 &`, { cwd: appDir, stdio: 'inherit', shell: '/bin/bash' });
-execSync('sleep 8');
 execSync('./cloudflared tunnel --url http://localhost:4173 > tunnel.log 2>&1 &', { stdio: 'inherit', shell: '/bin/bash' });
-execSync('sleep 8');
 
+await wait(8000);
 const tunnelLog = fs.readFileSync('tunnel.log', 'utf8');
 const urlMatch = tunnelLog.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/i);
-if (!urlMatch) throw new Error('Could not get Cloudflare tunnel URL');
+if (!urlMatch) {
+  await updateDeployment({ status: 'failed', workflow_status: 'failed', error_message: 'Unable to parse tunnel URL.' });
+  throw new Error('Unable to parse tunnel URL');
+}
 
 const publicUrl = urlMatch[0];
-await log(`Tunnel live: ${publicUrl}`);
+const tunnelHostname = new URL(publicUrl).hostname;
+await updateDeployment({ status: 'warming', public_url: publicUrl, tunnel_hostname: tunnelHostname, workflow_status: 'running' });
+await log(`Tunnel ready: ${publicUrl}`);
 
-await supabase.from('deployments').update({ status: 'ready', public_url: publicUrl, healthcheck_url: publicUrl }).eq('id', deploymentId);
-
-const health = await fetch(publicUrl);
-if (!health.ok) {
-  await supabase.from('deployments').update({ status: 'failed' }).eq('id', deploymentId);
-  throw new Error(`Health check failed: ${health.status}`);
+const tunnelHealthy = await verifyUrlHealthy(publicUrl);
+if (!tunnelHealthy) {
+  await updateDeployment({ status: 'failed', health_status: 'unhealthy', workflow_status: 'failed', error_message: 'Tunnel health check failed.' });
+  throw new Error('Tunnel health check failed.');
 }
 
-await log('Health check passed. Updating Cloudflare DNS.');
+await updateDeployment({ status: 'ready', health_status: 'healthy' });
+await log('Tunnel health check passed. Updating FreeDomain DNS.');
 
-const recordName = project.subdomain ? `${project.subdomain}.${project.domain}` : project.domain;
-const targetHostname = new URL(publicUrl).hostname;
-
-const listRes = await fetch(`https://api.cloudflare.com/client/v4/zones/${project.cloudflare_zone_id}/dns_records?name=${recordName}`, {
-  headers: { Authorization: `Bearer ${project.cloudflare_api_token}`, 'Content-Type': 'application/json' },
+const dnsResult = await updateFreeDomainDns({
+  domain: project.domain,
+  apiKey: project.free_domain_dns_api_key,
+  targetHostname: tunnelHostname,
 });
 
-const listJson = await listRes.json();
-const existing = listJson?.result?.[0];
-
-if (existing) {
-  await fetch(`https://api.cloudflare.com/client/v4/zones/${project.cloudflare_zone_id}/dns_records/${existing.id}`, {
-    method: 'PUT',
-    headers: { Authorization: `Bearer ${project.cloudflare_api_token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ type: 'CNAME', name: recordName, content: targetHostname, proxied: true, ttl: 1 }),
-  });
-} else {
-  await fetch(`https://api.cloudflare.com/client/v4/zones/${project.cloudflare_zone_id}/dns_records`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${project.cloudflare_api_token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ type: 'CNAME', name: recordName, content: targetHostname, proxied: true, ttl: 1 }),
-  });
+if (!dnsResult.ok) {
+  await updateDeployment({ status: 'failed', workflow_status: 'failed', error_message: dnsResult.body });
+  await supabase.from('domain_mappings').upsert({ domain: project.domain, dns_status: 'failed' }, { onConflict: 'domain' });
+  throw new Error(dnsResult.body);
 }
 
-await supabase.from('domain_mappings').insert({
-  project_id: projectId,
-  deployment_id: deploymentId,
-  fqdn: recordName,
-  target_hostname: targetHostname,
-  status: 'active',
-});
+await log('FreeDomain DNS update request accepted. Verifying domain health...');
+const domainHealthy = await verifyUrlHealthy(`https://${project.domain}`);
+if (!domainHealthy) {
+  await updateDeployment({ status: 'failed', workflow_status: 'failed', error_message: 'Domain verification failed after DNS update.' });
+  await supabase.from('domain_mappings').upsert(
+    {
+      domain: project.domain,
+      active_deployment_id: deploymentId,
+      tunnel_hostname: tunnelHostname,
+      last_dns_update_at: new Date().toISOString(),
+      dns_status: 'failed',
+    },
+    { onConflict: 'domain' },
+  );
+  throw new Error('Domain verification failed.');
+}
 
-await supabase.from('deployments').update({ status: 'active' }).eq('id', deploymentId);
-await log('Deployment is active.');
+await supabase.from('domain_mappings').upsert(
+  {
+    domain: project.domain,
+    active_deployment_id: deploymentId,
+    tunnel_hostname: tunnelHostname,
+    last_dns_update_at: new Date().toISOString(),
+    dns_status: 'active',
+  },
+  { onConflict: 'domain' },
+);
 
-const { data: activeRows } = await supabase
+await updateDeployment({ status: 'active', workflow_status: 'active', became_active_at: new Date().toISOString() });
+await log('Deployment marked active and domain now points to latest healthy tunnel.');
+
+const { data: oldDeployments } = await supabase
   .from('deployments')
   .select('id,workflow_run_id')
   .eq('project_id', projectId)
   .eq('status', 'active')
   .neq('id', deploymentId);
 
-for (const oldRow of activeRows ?? []) {
-  await supabase.from('deployments').update({ status: 'draining' }).eq('id', oldRow.id);
-  if (oldRow.workflow_run_id) {
+for (const old of oldDeployments ?? []) {
+  await supabase.from('deployments').update({ status: 'draining', workflow_status: 'draining' }).eq('id', old.id);
+
+  if (old.workflow_run_id) {
     const octokit = new Octokit({ auth: process.env.GITHUB_PAT });
     const [owner, repo] = process.env.ACTIONHOST_REPO_PATH.split('/');
-    await octokit.rest.actions.cancelWorkflowRun({ owner, repo, run_id: Number(oldRow.workflow_run_id) });
+    await octokit.rest.actions.cancelWorkflowRun({ owner, repo, run_id: Number(old.workflow_run_id) });
   }
-  await supabase.from('deployments').update({ status: 'stopped' }).eq('id', oldRow.id);
+
+  await supabase.from('deployments').update({ status: 'stopped', workflow_status: 'stopped' }).eq('id', old.id);
+  await log(`Stopped previous deployment: ${old.id}`);
 }
+
+await supabase.from('workflow_runs').insert({
+  deployment_id: deploymentId,
+  github_run_id: workflowRunId || 'unknown',
+  status: 'completed',
+});
