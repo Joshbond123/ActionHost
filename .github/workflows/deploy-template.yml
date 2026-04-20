@@ -1,13 +1,51 @@
-name: Deprecated Deployment Template
+name: Deploy Template (Compatibility Shim)
 
 on:
   workflow_dispatch:
+    inputs:
+      repo_url:
+        required: false
+        type: string
+      project_id:
+        required: false
+        type: string
+      deployment_id:
+        required: false
+        type: string
+      build_command:
+        required: false
+        type: string
+      start_command:
+        required: false
+        type: string
+      supabase_url:
+        required: false
+        type: string
+      supabase_key:
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  actions: write
 
 jobs:
   redirect:
     runs-on: ubuntu-latest
     steps:
-      - name: Fail with migration note
+      - name: Redirect to deploy-worker
         run: |
-          echo "This workflow is deprecated. Use deploy-worker.yml instead."
-          exit 1
+          echo "deploy-template.yml is deprecated. Use deploy-worker.yml directly."
+          echo "If project_id and deployment_id are provided, triggering deploy-worker..."
+          if [ -n "${{ inputs.project_id }}" ] && [ -n "${{ inputs.deployment_id }}" ]; then
+            curl -fsSL \
+              -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${{ vars.ACTIONHOST_GITHUB_PAT }}" \
+              "https://api.github.com/repos/${{ vars.ACTIONHOST_REPO_PATH }}/actions/workflows/deploy-worker.yml/dispatches" \
+              -d "{\"ref\":\"main\",\"inputs\":{\"project_id\":\"${{ inputs.project_id }}\",\"deployment_id\":\"${{ inputs.deployment_id }}\"}}"
+            echo "Dispatched deploy-worker.yml successfully."
+          else
+            echo "No project_id/deployment_id provided. Nothing to do."
+            echo "Please use the Supabase deploy edge function or trigger deploy-worker.yml directly."
+          fi
