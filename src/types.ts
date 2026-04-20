@@ -55,3 +55,14 @@ export interface LogEntry {
   message: string;
   created_at: string;
 }
+
+export interface CerebrasKey {
+  id: string;
+  label: string;
+  usage_count: number;
+  success_count: number;
+  fail_count: number;
+  last_used_at: string | null;
+  is_active: boolean;
+  created_at: string;
+}
