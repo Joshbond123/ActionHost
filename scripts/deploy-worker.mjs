@@ -46,44 +46,67 @@ const parseDomain = (domain) => {
 
 const updateFreeDomainDns = async ({ domain, apiKey, targetHostname }) => {
   if (!apiKey || apiKey === 'test' || apiKey.length < 5) {
-    return { ok: false, body: 'FreeDomain DNS API key not configured or invalid.' };
+    return { ok: false, body: 'DNS API key not configured or invalid.' };
   }
   const { root, host } = parseDomain(domain);
-  const apiBase = process.env.FREEDOMAIN_DNS_API_BASE || 'https://update.dnsexit.com/RemoteUpdate.sv';
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  // ── Strategy 1: DNSExit new REST API (api.dnsexit.com/dns/) ──────────────────
+  // The old RemoteUpdate.sv endpoint returns 503 consistently since ~April 2026.
+  // The new API requires your DNSExit ACCOUNT API key (from dnsexit.com → My Account → API Access).
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000);
+    const response = await fetch('https://api.dnsexit.com/dns/', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
+      body: JSON.stringify({
+        apikey: apiKey,
+        domain: root,
+        update: [{ type: 'CNAME', host, data: targetHostname }],
+      }),
+    });
+    clearTimeout(timeout);
+    const body = await response.text();
+    console.log(`DNSExit new API: status=${response.status} body=${body}`);
     try {
-      const url = `${apiBase}?apikey=${encodeURIComponent(apiKey)}&domain=${encodeURIComponent(root)}&host=${encodeURIComponent(host)}&recordtype=CNAME&target=${encodeURIComponent(targetHostname)}`;
+      const parsed = JSON.parse(body);
+      // DNSExit new API returns {"code":0,...} on success
+      if (parsed.code === 0) return { ok: true, body };
+      // Auth error — API key is the old FreeDomain key, not account key
+      if (parsed.code === 2) {
+        await log('DNS API key is the old FreeDomain dynamic key. Get your account API key from dnsexit.com → My Account → API Access.', 'warn');
+      } else {
+        await log(`DNSExit new API error (code ${parsed.code}): ${parsed.message}`, 'warn');
+      }
+    } catch {
+      if (response.ok) return { ok: true, body };
+    }
+  } catch (err) {
+    console.error('DNSExit new API failed:', err.message);
+  }
+
+  // ── Strategy 2: Legacy RemoteUpdate.sv (may return 503 if endpoint is down) ──
+  const legacyBase = process.env.FREEDOMAIN_DNS_API_BASE || 'https://update.dnsexit.com/RemoteUpdate.sv';
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    try {
+      const url = `${legacyBase}?apikey=${encodeURIComponent(apiKey)}&domain=${encodeURIComponent(root)}&host=${encodeURIComponent(host)}&recordtype=CNAME&target=${encodeURIComponent(targetHostname)}`;
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 15000);
+      const timeout = setTimeout(() => controller.abort(), 12000);
       const response = await fetch(url, { method: 'GET', signal: controller.signal });
       clearTimeout(timeout);
       const body = await response.text();
-      console.log(`DNS update attempt ${attempt}: status=${response.status} body=${body}`);
-
-      // DNSExit returns "0=Success" on success
-      if (response.ok && body.startsWith('0=')) {
-        return { ok: true, body };
-      }
-      // Some providers return "good" or "nochg" on success
-      if (response.ok && /^(ok|success|good|nochg)/i.test(body.trim())) {
-        return { ok: true, body };
-      }
-      // If server error (5xx), retry
-      if (response.status >= 500) {
-        await log(`DNS API returned ${response.status}, retrying (attempt ${attempt}/3)...`, 'warn');
-      } else {
-        await log(`DNS API response (attempt ${attempt}): ${body}`, 'warn');
-      }
+      console.log(`DNSExit legacy API attempt ${attempt}: status=${response.status} body=${body.slice(0, 100)}`);
+      if (response.ok && body.startsWith('0=')) return { ok: true, body };
+      if (response.ok && /^(ok|success|good|nochg)/i.test(body.trim())) return { ok: true, body };
+      if (response.status >= 500) await log(`DNS legacy API returned ${response.status} (endpoint may be down).`, 'warn');
     } catch (err) {
-      console.error(`DNS update attempt ${attempt} failed:`, err.message);
-      await log(`DNS update attempt ${attempt} error: ${err.message}`, 'warn');
+      console.error(`DNS legacy attempt ${attempt} error:`, err.message);
     }
-
-    if (attempt < 3) await wait(5000 * attempt);
+    if (attempt < 2) await wait(5000);
   }
 
-  return { ok: false, body: 'DNS update failed after 3 retries.' };
+  return { ok: false, body: 'All DNS update methods failed. Use your DNSExit account API key (from dnsexit.com → My Account → API Access) or set the CNAME record manually.' };
 };
 
 const verifyUrlHealthy = async (url, maxAttempts = 8, delayMs = 5000) => {
@@ -158,12 +181,31 @@ try {
 // All ActionHost-detected apps run on port 4173 (PORT=4173 is embedded in start commands)
 const APP_PORT = 4173;
 
+// Load env vars stored for this project (set via ActionHost UI)
+let projectEnvVars = {};
+try {
+  const { data: envSetting } = await supabase.from('settings').select('value').eq('key', `env_${projectId}`).single();
+  if (envSetting?.value) {
+    projectEnvVars = JSON.parse(envSetting.value);
+    const envCount = Object.keys(projectEnvVars).length;
+    if (envCount > 0) await log(`Injecting ${envCount} environment variable(s) from project settings.`);
+  }
+} catch {
+  // no env vars saved — that's fine
+}
+
+// Build the env export lines for the shell script
+const envExports = Object.entries(projectEnvVars)
+  .map(([k, v]) => `export ${k}=${JSON.stringify(String(v))}`)
+  .join('\n');
+
 // Start app in background using a shell wrapper script for reliable detachment
 const startCmd = project.detected_start_command || `npm run preview -- --host 0.0.0.0 --port ${APP_PORT}`;
 await log(`Starting app: ${startCmd}`);
 
 // Write a startup script that handles the background process reliably
 fs.writeFileSync('start-app.sh', `#!/bin/bash
+${envExports}
 cd target-app
 ${startCmd} >> ../app.log 2>&1 &
 echo $! > ../app.pid
