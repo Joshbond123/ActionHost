@@ -25,10 +25,32 @@ const repoParser = (repoUrl: string) => {
   return { owner: match[1], repo: match[2].replace(/\.git$/, '') };
 };
 
-const detectFromFiles = (files: string[]): Omit<Detection, 'branch'> => {
+const detectFromFiles = (files: string[], pkgScripts: Record<string, string>): Omit<Detection, 'branch'> => {
   const names = new Set(files.map((file) => file.toLowerCase()));
 
-  if (names.has('next.config.js') || names.has('next.config.mjs') || names.has('next.config.ts')) {
+  const hasServerFile = names.has('server.ts') || names.has('server.js') || names.has('server.mjs') || names.has('app.ts') || names.has('app.js');
+  const hasViteConfig = names.has('vite.config.ts') || names.has('vite.config.js') || names.has('vite.config.mjs');
+  const hasNextConfig = names.has('next.config.js') || names.has('next.config.mjs') || names.has('next.config.ts');
+
+  // Express + Vite hybrid: has both vite config and a server entry file
+  // Or package.json "start" script runs a server file (tsx/node server.ts)
+  const startScript = pkgScripts['start'] ?? '';
+  const isExpressServer = hasServerFile && (
+    startScript.includes('server.ts') || startScript.includes('server.js') ||
+    startScript.includes('app.ts') || startScript.includes('app.js') ||
+    startScript.includes('tsx') || startScript.includes('ts-node')
+  );
+
+  if (isExpressServer && hasViteConfig) {
+    return {
+      framework: 'Node.js (Express + Vite)',
+      buildCommand: 'npm run build',
+      startCommand: 'PORT=4173 NODE_ENV=production npm start',
+      strategy: 'build-and-run-express',
+    };
+  }
+
+  if (hasNextConfig) {
     return {
       framework: 'Next.js',
       buildCommand: 'npm run build',
@@ -37,7 +59,7 @@ const detectFromFiles = (files: string[]): Omit<Detection, 'branch'> => {
     };
   }
 
-  if (names.has('vite.config.ts') || names.has('vite.config.js') || names.has('vite.config.mjs')) {
+  if (hasViteConfig) {
     return {
       framework: 'Vite',
       buildCommand: 'npm run build',
@@ -74,6 +96,14 @@ const detectFromFiles = (files: string[]): Omit<Detection, 'branch'> => {
   }
 
   if (names.has('package.json')) {
+    if (isExpressServer) {
+      return {
+        framework: 'Node.js (Express)',
+        buildCommand: 'npm run build 2>/dev/null || echo "no build"',
+        startCommand: 'PORT=4173 NODE_ENV=production npm start',
+        strategy: 'node-express-runtime',
+      };
+    }
     return {
       framework: 'Node.js',
       buildCommand: 'npm run build',
@@ -111,7 +141,23 @@ const detectRepository = async (repoUrl: string, githubPat?: string): Promise<De
   }
 
   const files = ((await contentsRes.json()) as Array<{ name: string }>).map((item) => item.name);
-  const detected = detectFromFiles(files);
+
+  // Also fetch package.json scripts if present
+  let pkgScripts: Record<string, string> = {};
+  if (files.some(f => f.toLowerCase() === 'package.json')) {
+    try {
+      const pkgRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents/package.json`, { headers });
+      if (pkgRes.ok) {
+        const pkgData = await pkgRes.json() as { content?: string };
+        if (pkgData.content) {
+          const pkgJson = JSON.parse(atob(pkgData.content.replace(/\n/g, '')));
+          pkgScripts = pkgJson.scripts ?? {};
+        }
+      }
+    } catch (_) { /* ignore */ }
+  }
+
+  const detected = detectFromFiles(files, pkgScripts);
   return { ...detected, branch: defaultBranch };
 };
 
@@ -188,7 +234,6 @@ Deno.serve(async (request) => {
       message: `Deployment queued for ${repoUrl}. Detected ${detection.framework} (branch: ${detection.branch}).`,
     });
 
-    // Trigger GitHub Actions workflow
     const dispatchRes = await fetch(
       `https://api.github.com/repos/${actionhostRepoPath}/actions/workflows/deploy-worker.yml/dispatches`,
       {
@@ -210,7 +255,6 @@ Deno.serve(async (request) => {
 
     if (!dispatchRes.ok) {
       const reason = await dispatchRes.text();
-      // Log the error but don't fail — deployment record is created
       await supabase.from('logs').insert({
         deployment_id: deployment.id,
         level: 'error',
