@@ -153,8 +153,7 @@ try {
 // Download and start Cloudflare Quick Tunnel
 await log('Starting Cloudflare Quick Tunnel...');
 try {
-  execSync('curl -fsSL -o cloudflared.tgz https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.tgz', { stdio: 'inherit' });
-  execSync('tar -xzf cloudflared.tgz && chmod +x cloudflared');
+  execSync('curl -fsSL -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && chmod +x cloudflared', { stdio: 'inherit' });
 } catch (err) {
   await updateDeployment({ status: 'failed', error_message: `cloudflared download failed: ${err.message}` });
   await log(`cloudflared download failed: ${err.message}`, 'error');
