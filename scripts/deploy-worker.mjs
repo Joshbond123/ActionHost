@@ -329,11 +329,15 @@ for (const old of oldDeployments ?? []) {
   await log(`Stopped previous deployment: ${old.id}`);
 }
 
-await supabase.from('workflow_runs').insert({
-  deployment_id: deploymentId,
-  github_run_id: workflowRunId || 'unknown',
-  status: 'completed',
-}).catch(() => {});
+try {
+  await supabase.from('workflow_runs').insert({
+    deployment_id: deploymentId,
+    github_run_id: workflowRunId || 'unknown',
+    status: 'completed',
+  });
+} catch {
+  // table may not exist — non-fatal
+}
 
 await log('Deployment worker finished. App is live!');
 await log(`Tunnel URL: ${publicUrl}`);
@@ -341,13 +345,18 @@ await log(`Tunnel URL: ${publicUrl}`);
 // Keep runner alive to maintain the tunnel and app
 await log('Keeping runner alive to maintain tunnel and app server...');
 while (true) {
-  await wait(60000);
-  // Periodic health check
-  const stillHealthy = await verifyUrlHealthy(publicUrl, 2, 3000);
-  if (!stillHealthy) {
-    await log('Tunnel health degraded - runner still active but app may be unresponsive', 'warn');
-    await updateDeployment({ health_status: 'unhealthy' });
-  } else {
-    await updateDeployment({ health_status: 'healthy' });
+  try {
+    await wait(60000);
+    // Periodic health check
+    const stillHealthy = await verifyUrlHealthy(publicUrl, 2, 3000);
+    if (!stillHealthy) {
+      await log('Tunnel health degraded - runner still active but app may be unresponsive', 'warn');
+      await updateDeployment({ health_status: 'unhealthy' });
+    } else {
+      await updateDeployment({ health_status: 'healthy' });
+    }
+  } catch (err) {
+    // Never let an unhandled exception kill the runner — that would tear down the tunnel
+    console.error('[keep-alive] Caught error (non-fatal, continuing):', err?.message);
   }
 }
