@@ -242,18 +242,22 @@ const tunnelHostname = new URL(publicUrl).hostname;
 await updateDeployment({ status: 'warming', public_url: publicUrl, tunnel_hostname: tunnelHostname, workflow_status: 'running' });
 await log(`Tunnel ready: ${publicUrl}`);
 
-// Health check tunnel
-const tunnelHealthy = await verifyUrlHealthy(publicUrl, 10, 5000);
-if (!tunnelHealthy) {
-  const appLog = fs.existsSync('app.log') ? fs.readFileSync('app.log', 'utf8').slice(-1000) : '(no log)';
-  await updateDeployment({ status: 'failed', health_status: 'unhealthy', workflow_status: 'failed', error_message: 'Tunnel health check failed - app may have crashed on startup.' });
+// Health check: check the app responds on localhost (NOT the public tunnel URL).
+// Checking the tunnel URL from inside the same runner requires a round-trip over the
+// internet back to itself, which routinely fails with 5xx even when the tunnel is live.
+// If the local port is up, cloudflared is forwarding it correctly.
+await log(`Verifying app is responding on localhost:${APP_PORT}...`);
+const localHealthy = await verifyUrlHealthy(`http://localhost:${APP_PORT}`, 12, 5000);
+if (!localHealthy) {
+  const appLog = fs.existsSync('app.log') ? fs.readFileSync('app.log', 'utf8').slice(-2000) : '(no log)';
+  await updateDeployment({ status: 'failed', health_status: 'unhealthy', workflow_status: 'failed', error_message: 'App health check failed - app did not start or crashed on port ' + APP_PORT });
   await log(`App log: ${appLog}`, 'error');
-  await log('Tunnel health check failed after 10 attempts.', 'error');
+  await log(`App health check failed: no response on localhost:${APP_PORT} after 12 attempts.`, 'error');
   process.exit(1);
 }
 
 await updateDeployment({ status: 'ready', health_status: 'healthy' });
-await log('Tunnel health check passed.');
+await log(`App health check passed — responding on localhost:${APP_PORT}.`);
 
 // Update FreeDomain DNS — non-fatal (tunnel is still live even if DNS fails)
 let dnsSuccess = false;
@@ -347,10 +351,10 @@ await log('Keeping runner alive to maintain tunnel and app server...');
 while (true) {
   try {
     await wait(60000);
-    // Periodic health check
-    const stillHealthy = await verifyUrlHealthy(publicUrl, 2, 3000);
+    // Check localhost (not the public tunnel URL — runner can't reliably reach its own tunnel externally)
+    const stillHealthy = await verifyUrlHealthy(`http://localhost:${APP_PORT}`, 2, 3000);
     if (!stillHealthy) {
-      await log('Tunnel health degraded - runner still active but app may be unresponsive', 'warn');
+      await log(`App on localhost:${APP_PORT} appears unresponsive - tunnel may be degraded`, 'warn');
       await updateDeployment({ health_status: 'unhealthy' });
     } else {
       await updateDeployment({ health_status: 'healthy' });
