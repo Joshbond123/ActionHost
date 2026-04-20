@@ -28,7 +28,7 @@ const repoParser = (repoUrl: string) => {
 const detectFromFiles = (files: string[]): Omit<Detection, 'branch'> => {
   const names = new Set(files.map((file) => file.toLowerCase()));
 
-  if (names.has('next.config.js') || names.has('next.config.mjs')) {
+  if (names.has('next.config.js') || names.has('next.config.mjs') || names.has('next.config.ts')) {
     return {
       framework: 'Next.js',
       buildCommand: 'npm run build',
@@ -37,7 +37,7 @@ const detectFromFiles = (files: string[]): Omit<Detection, 'branch'> => {
     };
   }
 
-  if (names.has('vite.config.ts') || names.has('vite.config.js')) {
+  if (names.has('vite.config.ts') || names.has('vite.config.js') || names.has('vite.config.mjs')) {
     return {
       framework: 'Vite',
       buildCommand: 'npm run build',
@@ -52,6 +52,24 @@ const detectFromFiles = (files: string[]): Omit<Detection, 'branch'> => {
       buildCommand: 'echo "python build not required"',
       startCommand: 'python app.py',
       strategy: 'python-runtime',
+    };
+  }
+
+  if (names.has('cargo.toml')) {
+    return {
+      framework: 'Rust',
+      buildCommand: 'cargo build --release',
+      startCommand: './target/release/app',
+      strategy: 'rust-runtime',
+    };
+  }
+
+  if (names.has('go.mod')) {
+    return {
+      framework: 'Go',
+      buildCommand: 'go build -o app .',
+      startCommand: './app',
+      strategy: 'go-runtime',
     };
   }
 
@@ -72,12 +90,16 @@ const detectFromFiles = (files: string[]): Omit<Detection, 'branch'> => {
   };
 };
 
-const detectRepository = async (repoUrl: string): Promise<Detection> => {
+const detectRepository = async (repoUrl: string, githubPat?: string): Promise<Detection> => {
   const { owner, repo } = repoParser(repoUrl);
-  const repoRes = await fetch(`https://api.github.com/repos/${owner}/${repo}`);
-  const defaultBranch = repoRes.ok ? (await repoRes.json()).default_branch || 'main' : 'main';
 
-  const contentsRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents`);
+  const headers: Record<string, string> = { Accept: 'application/vnd.github+json' };
+  if (githubPat) headers['Authorization'] = `Bearer ${githubPat}`;
+
+  const repoRes = await fetch(`https://api.github.com/repos/${owner}/${repo}`, { headers });
+  const defaultBranch = repoRes.ok ? ((await repoRes.json()).default_branch || 'main') : 'main';
+
+  const contentsRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/contents`, { headers });
   if (!contentsRes.ok) {
     return {
       framework: 'Node.js',
@@ -100,16 +122,26 @@ Deno.serve(async (request) => {
     const body = (await request.json()) as DeployRequest;
     const { repoUrl, freeDomainDomain, freeDomainDnsApiKey } = body;
 
-    if (!repoUrl || !freeDomainDomain || !freeDomainDnsApiKey) {
-      throw new Error('repoUrl, freeDomainDomain, and freeDomainDnsApiKey are required.');
+    if (!repoUrl) throw new Error('repoUrl is required.');
+    if (!freeDomainDomain) throw new Error('freeDomainDomain is required.');
+    if (!freeDomainDnsApiKey) throw new Error('freeDomainDnsApiKey is required.');
+
+    const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? '';
+    const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
+
+    if (!supabaseUrl || !supabaseServiceKey) {
+      throw new Error('Supabase credentials not configured in edge function environment.');
     }
 
-    const supabase = createClient(
-      Deno.env.get('SUPABASE_URL') ?? '',
-      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '',
-    );
+    const supabase = createClient(supabaseUrl, supabaseServiceKey);
 
-    const detection = await detectRepository(repoUrl);
+    const githubPat = Deno.env.get('GITHUB_PAT');
+    const actionhostRepoPath = Deno.env.get('ACTIONHOST_REPO_PATH');
+
+    if (!githubPat) throw new Error('GITHUB_PAT not configured in edge function environment. Set it in Supabase Edge Function secrets.');
+    if (!actionhostRepoPath) throw new Error('ACTIONHOST_REPO_PATH not configured in edge function environment.');
+
+    const detection = await detectRepository(repoUrl, githubPat);
     const projectName = repoUrl.split('/').pop()?.replace(/\.git$/, '') ?? 'project';
 
     const { data: project, error: projectError } = await supabase
@@ -128,7 +160,7 @@ Deno.serve(async (request) => {
       .select()
       .single();
 
-    if (projectError) throw projectError;
+    if (projectError) throw new Error(`Failed to create project: ${projectError.message}`);
 
     const { data: deployment, error: deploymentError } = await supabase
       .from('deployments')
@@ -148,38 +180,51 @@ Deno.serve(async (request) => {
       .select()
       .single();
 
-    if (deploymentError) throw deploymentError;
+    if (deploymentError) throw new Error(`Failed to create deployment: ${deploymentError.message}`);
 
     await supabase.from('logs').insert({
       deployment_id: deployment.id,
       level: 'info',
-      message: `Deployment queued for ${repoUrl}. Detected ${detection.framework} (${detection.branch}).`,
+      message: `Deployment queued for ${repoUrl}. Detected ${detection.framework} (branch: ${detection.branch}).`,
     });
 
-    const githubPat = Deno.env.get('GITHUB_PAT');
-    const actionhostRepoPath = Deno.env.get('ACTIONHOST_REPO_PATH');
-    if (!githubPat || !actionhostRepoPath) throw new Error('Missing GITHUB_PAT or ACTIONHOST_REPO_PATH in edge-function env.');
-
-    const dispatch = await fetch(`https://api.github.com/repos/${actionhostRepoPath}/actions/workflows/deploy-worker.yml/dispatches`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${githubPat}`,
-        Accept: 'application/vnd.github+json',
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        ref: 'main',
-        inputs: {
-          project_id: project.id,
-          deployment_id: deployment.id,
+    // Trigger GitHub Actions workflow
+    const dispatchRes = await fetch(
+      `https://api.github.com/repos/${actionhostRepoPath}/actions/workflows/deploy-worker.yml/dispatches`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${githubPat}`,
+          Accept: 'application/vnd.github+json',
+          'Content-Type': 'application/json',
         },
-      }),
-    });
+        body: JSON.stringify({
+          ref: 'main',
+          inputs: {
+            project_id: project.id,
+            deployment_id: deployment.id,
+          },
+        }),
+      },
+    );
 
-    if (!dispatch.ok) {
-      const reason = await dispatch.text();
+    if (!dispatchRes.ok) {
+      const reason = await dispatchRes.text();
+      // Log the error but don't fail — deployment record is created
+      await supabase.from('logs').insert({
+        deployment_id: deployment.id,
+        level: 'error',
+        message: `Failed to trigger GitHub workflow: ${reason}`,
+      });
+      await supabase.from('deployments').update({ status: 'failed', error_message: `Workflow trigger failed: ${reason}` }).eq('id', deployment.id);
       throw new Error(`Failed to trigger GitHub workflow: ${reason}`);
     }
+
+    await supabase.from('logs').insert({
+      deployment_id: deployment.id,
+      level: 'info',
+      message: 'GitHub Actions workflow triggered successfully.',
+    });
 
     return new Response(
       JSON.stringify({
