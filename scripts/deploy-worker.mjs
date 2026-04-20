@@ -1,6 +1,6 @@
 import { Octokit } from 'octokit';
 import { createClient } from '@supabase/supabase-js';
-import { execSync, spawn } from 'node:child_process';
+import { execSync, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 
 const deploymentId = process.env.DEPLOYMENT_ID;
@@ -61,23 +61,23 @@ const updateFreeDomainDns = async ({ domain, apiKey, targetHostname }) => {
       const body = await response.text();
       console.log(`DNS update attempt ${attempt}: status=${response.status} body=${body}`);
 
-      // DNSExit returns 0=success, non-zero codes are errors
+      // DNSExit returns "0=Success" on success
       if (response.ok && body.startsWith('0=')) {
         return { ok: true, body };
       }
-      // Some providers return plain "OK"
+      // Some providers return "good" or "nochg" on success
       if (response.ok && /^(ok|success|good|nochg)/i.test(body.trim())) {
         return { ok: true, body };
       }
-      // If 503 or server error, retry
+      // If server error (5xx), retry
       if (response.status >= 500) {
         await log(`DNS API returned ${response.status}, retrying (attempt ${attempt}/3)...`, 'warn');
       } else {
-        // Client error or non-success response
         await log(`DNS API response (attempt ${attempt}): ${body}`, 'warn');
       }
     } catch (err) {
       console.error(`DNS update attempt ${attempt} failed:`, err.message);
+      await log(`DNS update attempt ${attempt} error: ${err.message}`, 'warn');
     }
 
     if (attempt < 3) await wait(5000 * attempt);
@@ -131,10 +131,7 @@ if (hasPackageJson) {
   await log('Installing dependencies...');
   try {
     const lockExists = fs.existsSync('target-app/package-lock.json');
-    const yarnLockExists = fs.existsSync('target-app/yarn.lock');
-    let installCmd = 'npm install';
-    if (lockExists) installCmd = 'npm ci';
-    else if (yarnLockExists) installCmd = 'yarn install --frozen-lockfile 2>/dev/null || yarn install';
+    const installCmd = lockExists ? 'npm ci' : 'npm install';
     execSync(installCmd, { cwd: 'target-app', stdio: 'inherit' });
   } catch (err) {
     await updateDeployment({ status: 'failed', error_message: `npm install failed: ${err.message}` });
@@ -143,19 +140,14 @@ if (hasPackageJson) {
   }
 }
 
-// Determine app port - use 4173 by default, but 3000 for Express+Vite apps
-const isExpressVite = (project.detected_framework || '').toLowerCase().includes('express');
-const APP_PORT = isExpressVite ? 3000 : 4173;
-
 // Build
 const buildCmd = project.detected_build_command || 'npm run build';
 await log(`Running build: ${buildCmd}`);
 try {
   execSync(buildCmd, { cwd: 'target-app', stdio: 'inherit', shell: '/bin/bash' });
 } catch (err) {
-  // Some apps don't need a build step - check if it's an intentional no-op
   if (buildCmd.startsWith('echo')) {
-    await log(`Build step skipped (no build required).`);
+    await log('Build step skipped (no build required).');
   } else {
     await updateDeployment({ status: 'failed', error_message: `Build failed: ${err.message}` });
     await log(`Build failed: ${err.message}`, 'error');
@@ -163,37 +155,47 @@ try {
   }
 }
 
-// Start app using spawn to keep it running in the background
+// All ActionHost-detected apps run on port 4173 (PORT=4173 is embedded in start commands)
+const APP_PORT = 4173;
+
+// Start app in background using a shell wrapper script for reliable detachment
 const startCmd = project.detected_start_command || `npm run preview -- --host 0.0.0.0 --port ${APP_PORT}`;
 await log(`Starting app: ${startCmd}`);
 
-// Use spawn instead of execSync for background processes - this avoids process death issues
-const appProcess = spawn('/bin/bash', ['-c', startCmd], {
-  cwd: 'target-app',
-  stdio: ['ignore', fs.openSync('../app.log', 'w'), fs.openSync('../app.log', 'a')],
-  detached: true,
-});
-appProcess.unref();
+// Write a startup script that handles the background process reliably
+fs.writeFileSync('start-app.sh', `#!/bin/bash
+cd target-app
+${startCmd} >> ../app.log 2>&1 &
+echo $! > ../app.pid
+echo "App started with PID $!"
+`);
+execSync('chmod +x start-app.sh && bash start-app.sh', { stdio: 'inherit' });
+await wait(5000); // Give the app 5 seconds to start
 
-await wait(5000); // Give the app time to start
+// Read app log to check for startup errors
+const appLogContent = fs.existsSync('app.log') ? fs.readFileSync('app.log', 'utf8') : '';
+if (appLogContent) {
+  await log(`App startup output: ${appLogContent.slice(0, 300)}`);
+}
 
-// Check if app started successfully
-if (!fs.existsSync('app.log') || (() => { try { return false; } catch { return true; }}) ) {
-  // Basic check - if log file exists we at least tried
+// Quick check if app is responding
+const appStarted = await verifyUrlHealthy(`http://localhost:${APP_PORT}`, 3, 3000);
+if (!appStarted) {
+  const appLog = fs.existsSync('app.log') ? fs.readFileSync('app.log', 'utf8') : '(no output)';
+  await log(`App startup log: ${appLog.slice(0, 500)}`, 'warn');
+  await log(`App not responding on port ${APP_PORT} after 9s, proceeding with tunnel anyway...`, 'warn');
 }
 
 // Download and start Cloudflare Quick Tunnel
 await log('Starting Cloudflare Quick Tunnel...');
 try {
-  // Download cloudflared binary directly (not tarball)
   execSync(
     'curl -fsSL -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && chmod +x cloudflared',
     { stdio: 'inherit' }
   );
 } catch (err) {
-  // Try alternate download method if direct binary fails
   try {
-    await log('Primary cloudflared download failed, trying alternate method...', 'warn');
+    await log('Primary cloudflared download failed, trying wget...', 'warn');
     execSync(
       'wget -q -O cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && chmod +x cloudflared',
       { stdio: 'inherit' }
@@ -205,12 +207,12 @@ try {
   }
 }
 
-// Start tunnel using spawn for reliable background process
-const tunnelProcess = spawn('/bin/bash', ['-c', `./cloudflared tunnel --url http://localhost:${APP_PORT} --no-autoupdate`], {
-  stdio: ['ignore', fs.openSync('tunnel.log', 'w'), fs.openSync('tunnel.log', 'a')],
-  detached: true,
-});
-tunnelProcess.unref();
+// Start tunnel in background
+fs.writeFileSync('start-tunnel.sh', `#!/bin/bash
+./cloudflared tunnel --url http://localhost:${APP_PORT} --no-autoupdate >> tunnel.log 2>&1 &
+echo $! > tunnel.pid
+`);
+execSync('chmod +x start-tunnel.sh && bash start-tunnel.sh', { stdio: 'inherit' });
 
 // Wait for tunnel URL to appear in log (up to 60s)
 let publicUrl = null;
@@ -230,7 +232,7 @@ if (!publicUrl) {
   const tunnelLog = fs.existsSync('tunnel.log') ? fs.readFileSync('tunnel.log', 'utf8') : '(no log)';
   const appLog = fs.existsSync('app.log') ? fs.readFileSync('app.log', 'utf8').slice(-500) : '(no log)';
   await updateDeployment({ status: 'failed', workflow_status: 'failed', error_message: 'Unable to parse tunnel URL from cloudflared output.' });
-  await log(`App log tail: ${appLog}`, 'error');
+  await log(`App log: ${appLog}`, 'error');
   await log(`Tunnel log: ${tunnelLog}`, 'error');
   await log('Unable to parse tunnel URL.', 'error');
   process.exit(1);
@@ -244,7 +246,7 @@ await log(`Tunnel ready: ${publicUrl}`);
 const tunnelHealthy = await verifyUrlHealthy(publicUrl, 10, 5000);
 if (!tunnelHealthy) {
   const appLog = fs.existsSync('app.log') ? fs.readFileSync('app.log', 'utf8').slice(-1000) : '(no log)';
-  await updateDeployment({ status: 'failed', health_status: 'unhealthy', workflow_status: 'failed', error_message: 'Tunnel health check failed - app may have crashed.' });
+  await updateDeployment({ status: 'failed', health_status: 'unhealthy', workflow_status: 'failed', error_message: 'Tunnel health check failed - app may have crashed on startup.' });
   await log(`App log: ${appLog}`, 'error');
   await log('Tunnel health check failed after 10 attempts.', 'error');
   process.exit(1);
@@ -253,9 +255,9 @@ if (!tunnelHealthy) {
 await updateDeployment({ status: 'ready', health_status: 'healthy' });
 await log('Tunnel health check passed.');
 
-// Update FreeDomain DNS - non-fatal if it fails (tunnel is still live)
+// Update FreeDomain DNS — non-fatal (tunnel is still live even if DNS fails)
 let dnsSuccess = false;
-if (project.domain && project.domain !== 'test.example.com') {
+if (project.domain && project.domain !== 'test.example.com' && project.free_domain_dns_api_key) {
   await log(`Updating FreeDomain DNS for domain: ${project.domain}`);
   const dnsResult = await updateFreeDomainDns({
     domain: project.domain,
@@ -269,17 +271,13 @@ if (project.domain && project.domain !== 'test.example.com') {
       { domain: project.domain, dns_status: 'failed', tunnel_hostname: tunnelHostname },
       { onConflict: 'domain' },
     );
-    // DNS failure is non-fatal - deployment continues with tunnel URL
   } else {
     dnsSuccess = true;
     await log(`DNS update accepted: ${dnsResult.body}`);
 
-    // Verify domain health (DNS propagation may take a few minutes)
-    await log(`Verifying domain health: https://${project.domain}`);
     const domainHealthy = await verifyUrlHealthy(`https://${project.domain}`, 12, 10000);
-
     if (!domainHealthy) {
-      await log('Domain health check failed after 12 attempts. DNS may still be propagating.', 'warn');
+      await log('Domain health check failed. DNS may still be propagating.', 'warn');
     }
 
     await supabase.from('domain_mappings').upsert(
@@ -301,13 +299,12 @@ await updateDeployment({
   became_active_at: new Date().toISOString(),
 });
 
-if (dnsSuccess) {
-  await log('Deployment active. Domain is live.');
-} else {
-  await log(`Deployment active. Tunnel URL: ${publicUrl} (DNS not configured or failed).`);
-}
+await log(dnsSuccess
+  ? 'Deployment active. Domain is live.'
+  : `Deployment active. App is live at tunnel URL: ${publicUrl}`
+);
 
-// Mark old deployments as draining/stopped
+// Mark old deployments as stopped
 const { data: oldDeployments } = await supabase
   .from('deployments')
   .select('id, workflow_run_id')
@@ -332,24 +329,25 @@ for (const old of oldDeployments ?? []) {
   await log(`Stopped previous deployment: ${old.id}`);
 }
 
-// Record workflow run
 await supabase.from('workflow_runs').insert({
   deployment_id: deploymentId,
   github_run_id: workflowRunId || 'unknown',
   status: 'completed',
-}).catch(() => {}); // non-fatal
+}).catch(() => {});
 
 await log('Deployment worker finished. App is live!');
-await log(`Direct tunnel URL: ${publicUrl}`);
+await log(`Tunnel URL: ${publicUrl}`);
 
-// Keep the process alive to maintain the tunnel and app server
+// Keep runner alive to maintain the tunnel and app
 await log('Keeping runner alive to maintain tunnel and app server...');
 while (true) {
   await wait(60000);
-  // Periodic health check to detect crashes
+  // Periodic health check
   const stillHealthy = await verifyUrlHealthy(publicUrl, 2, 3000);
   if (!stillHealthy) {
-    await log('Tunnel health degraded - runner is still active but app may be unresponsive', 'warn');
+    await log('Tunnel health degraded - runner still active but app may be unresponsive', 'warn');
     await updateDeployment({ health_status: 'unhealthy' });
+  } else {
+    await updateDeployment({ health_status: 'healthy' });
   }
 }
