@@ -1,67 +1,44 @@
 # ActionHost
 
-ActionHost deploys GitHub repositories as temporary hosted apps using GitHub Actions + Cloudflare Quick Tunnel, then maps a user-provided **FreeDomain** domain to the latest healthy deployment through DNS API updates.
+ActionHost deploys GitHub repositories with GitHub Actions, exposes them via **ngrok**, and keeps deployments fresh automatically when new commits are pushed.
 
-## Product flow
+## Architecture (ngrok-only)
 
-1. User enters:
-   - GitHub repository URL
-   - FreeDomain domain
-   - FreeDomain DNS API key
-2. ActionHost auto-detects runtime:
-   - framework/runtime
-   - branch
-   - build command
-   - start command
-   - deployment strategy
-3. Deployment worker:
-   - clones repo
-   - installs dependencies
-   - builds app
-   - starts app
-   - opens Cloudflare Quick Tunnel
-   - extracts tunnel hostname + URL
-4. Health checks tunnel URL.
-5. Updates FreeDomain DNS record (CNAME) to tunnel hostname.
-6. Verifies domain health.
-7. Marks deployment active and stops previous active workflow only after successful switch.
-8. Rotation scheduler queues a replacement deployment before expiration (~4h).
+- **No FreeDomain integration**
+- **No Cloudflare integration**
+- Public access is provided only through a reserved ngrok domain.
 
----
+## Deployment UI fields
 
-## Architecture
+The Deploy form includes only:
 
-### Frontend (GitHub Pages)
-- React + Vite dashboard
-- Deployment form fields:
-  - GitHub repository URL
-  - FreeDomain domain
-  - FreeDomain DNS API key
-- Shows:
-  - detected framework/runtime
-  - detected branch
-  - detected build/start commands
-  - deployment/workflow/domain status
-  - active URL
-  - history and logs
+- GitHub repository URL
+- ngrok authtoken
+- ngrok domain
+- Deploy button
 
-### Backend
-- Supabase Edge Functions:
-  - `deploy` (validate input, detect runtime, create project/deployment, dispatch workflow)
-  - `save-settings` (optional Cerebras key, backend only)
-- GitHub Actions workers:
-  - `deploy-worker.yml` runs deployment workflow logic
-  - `rotation-scheduler.yml` handles zero-downtime rotation window checks
-- Node worker scripts:
-  - `scripts/deploy-worker.mjs`
-  - `scripts/rotation-worker.mjs`
+## End-to-end flow
 
-### DNS integration
-- FreeDomain / DNSExit DNS API update via backend-only API key handling.
-- Dynamic domain parsing for root + host parts.
-- Retries on DNS update and domain verification checks.
+1. User submits repo URL + ngrok authtoken + ngrok domain.
+2. Backend detects framework/runtime, branch, build command, start command.
+3. Deploy worker clones/builds/starts app.
+4. Deploy worker configures ngrok and starts a tunnel using the reserved domain.
+5. Health check validates the new deployment.
+6. Deployment is marked active in Supabase.
+7. Previous active deployment is drained/stopped after successful activation.
+8. Scheduled monitor checks for:
+   - new commits on tracked repos (auto redeploy)
+   - near-expiry active deployments (rotation)
 
----
+## Automatic redeploy on new commits
+
+`rotation-scheduler.yml` runs the commit monitor logic in `scripts/rotation-worker.mjs`.
+For each `auto_deploy_enabled` project, it:
+
+- queries latest commit SHA from GitHub,
+- compares against `latest_deployed_commit_sha`,
+- queues a new deployment if changed,
+- dispatches `deploy-worker.yml` automatically.
 
 ## Supabase schema
 
@@ -72,37 +49,63 @@ Tables:
 - `projects`
 - `deployments`
 - `workflow_runs`
-- `domain_mappings`
 - `logs`
 - `settings`
 
----
+Deployments include:
+- repo URL
+- branch
+- commit SHA
+- detected framework/build/start commands
+- workflow run ID/status
+- public ngrok URL
+- deployment status + health
+- created/active timestamps
+- error message
 
 ## Required GitHub Actions variables
-
-Set these repository variables:
 
 - `VITE_SUPABASE_URL`
 - `VITE_SUPABASE_ANON_KEY`
 - `VITE_SUPABASE_FUNCTIONS_BASE_URL`
-- `ACTIONHOST_REPO_PATH` (example: `owner/repo`)
+- `ACTIONHOST_REPO_PATH`
+- `DEFAULT_TARGET_REPO` (optional)
+- `DEFAULT_NGROK_DOMAIN` (optional)
+- `DEFAULT_NGROK_AUTHTOKEN` (optional)
 - `ACTIONHOST_GITHUB_PAT`
 - `ACTIONHOST_SUPABASE_URL`
 - `ACTIONHOST_SUPABASE_SERVICE_ROLE_KEY`
-- `FREEDOMAIN_DNS_API_BASE` (optional override, default in worker script)
+- `ACTIONHOST_DEFAULT_TARGET_REPO` (optional default repo URL)
+- `ACTIONHOST_DEFAULT_NGROK_DOMAIN` (optional default ngrok domain)
+- `ACTIONHOST_DEFAULT_NGROK_AUTHTOKEN` (optional default ngrok token for backend)
 
----
-
-## Supabase Edge Function env vars
-
-Set these in Supabase Functions environment:
+## Required Supabase Edge Function env vars
 
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
 - `GITHUB_PAT`
 - `ACTIONHOST_REPO_PATH`
+- `DEFAULT_TARGET_REPO` (optional)
+- `DEFAULT_NGROK_DOMAIN` (optional)
+- `DEFAULT_NGROK_AUTHTOKEN` (optional)
 
----
+
+## Preconfigured target values
+
+This setup is configured to support:
+- Repository: `https://github.com/Joshbond123/Blog-Automator`
+- ngrok domain: `unapprehended-overemotionally-jeni.ngrok-free.dev`
+
+The rotation monitor can bootstrap this project automatically when these Action variables are set:
+- `ACTIONHOST_DEFAULT_TARGET_REPO`
+- `ACTIONHOST_DEFAULT_NGROK_DOMAIN`
+- `ACTIONHOST_DEFAULT_NGROK_AUTHTOKEN`
+
+## Security
+
+- ngrok authtoken is accepted by backend and stored in `settings` (service-role access), not exposed in frontend.
+- GitHub PAT and Supabase service key are backend/workflow-only.
+- Frontend is static on GitHub Pages.
 
 ## Local development
 
@@ -111,12 +114,4 @@ npm ci
 npm run dev
 ```
 
-Use `.env.example` for local frontend env setup.
-
----
-
-## Security
-
-- GitHub PAT, FreeDomain DNS API key, Supabase service keys, and optional Cerebras key are backend-only.
-- Frontend is static and hosted on GitHub Pages.
-- No secret keys are exposed in client code.
+Use `.env.example` for local Vite env vars.

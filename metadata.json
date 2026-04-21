@@ -1,6 +1,5 @@
 {
   "name": "ActionHost",
-  "description": "Deploy any GitHub repository as a temporary host using GitHub Actions with zero-downtime rotation and Cloudflare integration.",
-  "requestFramePermissions": [],
-  "majorCapabilities": []
+  "description": "Deploy any GitHub repository as a temporary host using GitHub Actions with zero-downtime rotation and ngrok integration.",
+  "tags": ["deployment", "github-actions", "ngrok", "supabase"]
 }
