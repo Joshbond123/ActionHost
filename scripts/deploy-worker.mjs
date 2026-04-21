@@ -72,6 +72,53 @@ if (!project.domain) {
 
 await updateDeployment({ status: 'starting', workflow_status: 'in_progress', workflow_run_id: workflowRunId || null });
 await log(`Starting deployment for ${project.repo_url}`);
+
+// ─── Stop any prior live deployments BEFORE starting our tunnel ──────────────
+// The ngrok reserved domain only allows one active endpoint at a time
+// (ERR_NGROK_334). If a previous deploy is still running, we must cancel its
+// GitHub Actions run so its ngrok process dies and releases the endpoint —
+// otherwise our new tunnel will fail to come online.
+try {
+  const { data: liveDeployments } = await supabase
+    .from('deployments')
+    .select('id, workflow_run_id, status')
+    .eq('project_id', projectId)
+    .in('status', ['active', 'ready', 'warming', 'starting'])
+    .neq('id', deploymentId);
+
+  if (liveDeployments && liveDeployments.length > 0) {
+    await log(`Found ${liveDeployments.length} prior live deployment(s) — stopping them to free the ngrok domain...`);
+    let cancelledAny = false;
+
+    for (const old of liveDeployments) {
+      await supabase.from('deployments').update({ status: 'draining', workflow_status: 'draining' }).eq('id', old.id);
+
+      if (old.workflow_run_id && process.env.GITHUB_PAT && process.env.ACTIONHOST_REPO_PATH) {
+        try {
+          const octokit = new Octokit({ auth: process.env.GITHUB_PAT });
+          const [owner, repo] = process.env.ACTIONHOST_REPO_PATH.split('/');
+          await octokit.rest.actions.cancelWorkflowRun({ owner, repo, run_id: Number(old.workflow_run_id) });
+          await log(`Cancelled previous workflow run ${old.workflow_run_id} (deployment ${old.id.slice(0, 8)}).`);
+          cancelledAny = true;
+        } catch (err) {
+          await log(`Could not cancel prior workflow run ${old.workflow_run_id}: ${err.message}`, 'warn');
+        }
+      }
+
+      await supabase.from('deployments').update({ status: 'stopped', workflow_status: 'stopped' }).eq('id', old.id);
+    }
+
+    if (cancelledAny) {
+      // Give ngrok edge time to recognize the previous tunnel is gone
+      // before we try to claim the same reserved domain.
+      await log('Waiting 20s for ngrok to release the reserved domain...');
+      await wait(20000);
+    }
+  }
+} catch (err) {
+  await log(`Pre-deploy cleanup of prior deployments failed: ${err.message}`, 'warn');
+}
+
 await log(`Framework: ${project.detected_framework ?? 'unknown'} | Branch: ${project.detected_branch ?? 'main'}`);
 await log(`ngrok domain: ${project.domain}`);
 
@@ -194,7 +241,7 @@ try {
 // Start ngrok bound to the reserved domain
 await log(`Starting ngrok tunnel bound to ${project.domain}...`);
 fs.writeFileSync('start-tunnel.sh', `#!/bin/bash
-./ngrok http --domain=${project.domain} ${APP_PORT} --log=stdout >> tunnel.log 2>&1 &
+./ngrok http --url=https://${project.domain} ${APP_PORT} --log=stdout >> tunnel.log 2>&1 &
 echo $! > tunnel.pid
 `);
 execSync('chmod +x start-tunnel.sh && bash start-tunnel.sh', { stdio: 'inherit' });
