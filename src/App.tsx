@@ -99,9 +99,9 @@ export default function App() {
   const [addingKey, setAddingKey] = useState(false);
   const [deletingKeyId, setDeletingKeyId] = useState<string | null>(null);
   const [form, setForm] = useState({
-    repoUrl: 'https://github.com/Joshbond123/Blog-Automator',
-    ngrokDomain: 'unapprehended-overemotionally-jeni.ngrok-free.dev',
-    ngrokAuthtoken: '32pTZFDvSXQRyInodWnMJB5QNak_3EF2pDaRfzw2nZ9GQ9iwG',
+    repoUrl: '',
+    ngrokDomain: '',
+    ngrokAuthtoken: '',
   });
   const [envVars, setEnvVars] = useState<EnvVar[]>([]);
 
@@ -154,9 +154,9 @@ export default function App() {
       if (!response.ok) throw new Error(payload.error ?? 'Deployment failed.');
       setSuccess(`Deployment queued: ${payload.deploymentId}`);
       setForm({
-        repoUrl: 'https://github.com/Joshbond123/Blog-Automator',
-        ngrokDomain: 'unapprehended-overemotionally-jeni.ngrok-free.dev',
-        ngrokAuthtoken: '32pTZFDvSXQRyInodWnMJB5QNak_3EF2pDaRfzw2nZ9GQ9iwG',
+        repoUrl: '',
+        ngrokDomain: '',
+        ngrokAuthtoken: '',
       });
       setEnvVars([]);
       setTab('dashboard');
