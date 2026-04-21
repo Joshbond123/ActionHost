@@ -98,57 +98,44 @@ const ensureDefaultProject = async () => {
   await queueDeployment(project, 'default project bootstrap', latestCommit.data.sha);
 };
 
-const main = async () => {
-  await ensureDefaultProject();
+await ensureDefaultProject();
 
-  const projectsResult = await supabase.from('projects').select('*');
-  if (projectsResult.error) throw projectsResult.error;
+const projectsResult = await supabase.from('projects').select('*');
+if (projectsResult.error) throw projectsResult.error;
 
-  for (const project of projectsResult.data ?? []) {
-    if (project.auto_deploy_enabled === false) continue;
+for (const project of projectsResult.data ?? []) {
+  if (project.auto_deploy_enabled === false) continue;
+  const { owner, repo } = parseRepo(project.repo_url);
+  const branch = project.detected_branch || 'main';
+  const latestCommit = await octokit.rest.repos.getCommit({ owner, repo, ref: branch });
+  const latestSha = latestCommit.data.sha;
 
-    const { owner, repo } = parseRepo(project.repo_url);
-    const branch = project.detected_branch || 'main';
-    const latestCommit = await octokit.rest.repos.getCommit({ owner, repo, ref: branch });
-    const latestSha = latestCommit.data.sha;
+  await supabase.from('projects').update({ latest_seen_commit_sha: latestSha }).eq('id', project.id);
 
-    await supabase.from('projects').update({ latest_seen_commit_sha: latestSha }).eq('id', project.id);
+  const active = await supabase
+    .from('deployments')
+    .select('id,expires_at,commit_sha,status')
+    .eq('project_id', project.id)
+    .eq('status', 'active')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
 
-    const active = await supabase
-      .from('deployments')
-      .select('id,expires_at,commit_sha,status')
-      .eq('project_id', project.id)
-      .eq('status', 'active')
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+  const activeDeployment = active.data;
+  const commitChanged = project.latest_deployed_commit_sha !== latestSha;
+  const nearExpiry = activeDeployment?.expires_at ? new Date(activeDeployment.expires_at).getTime() < Date.now() + 30 * 60 * 1000 : false;
 
-    const activeDeployment = active.data;
-    const commitChanged = project.latest_deployed_commit_sha !== latestSha;
-    const nearExpiry = activeDeployment?.expires_at ? new Date(activeDeployment.expires_at).getTime() < Date.now() + 30 * 60 * 1000 : false;
-
-    if (!activeDeployment) {
-      await queueDeployment(project, 'initial auto deployment', latestSha);
-      continue;
-    }
-
-    if (commitChanged) {
-      await queueDeployment(project, 'new repository commit detected', latestSha);
-      continue;
-    }
-
-    if (nearExpiry) {
-      await queueDeployment(project, 'rotation before expiry', latestSha);
-    }
+  if (!activeDeployment) {
+    await queueDeployment(project, 'initial auto deployment', latestSha);
+    continue;
   }
-};
 
-try {
-  await main();
-} catch (error) {
-  if (error?.code === 'PGRST204') {
-    console.log('Schema cache is stale or migrations are not applied yet. Skipping monitor run gracefully.');
-    process.exit(0);
+  if (commitChanged) {
+    await queueDeployment(project, 'new repository commit detected', latestSha);
+    continue;
   }
-  throw error;
+
+  if (nearExpiry) {
+    await queueDeployment(project, 'rotation before expiry', latestSha);
+  }
 }
