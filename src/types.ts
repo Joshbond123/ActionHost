@@ -29,6 +29,9 @@ export interface Project {
   name: string;
   repo_url: string;
   domain: string;
+  ngrok_authtoken?: string | null;
+  last_deployed_sha?: string | null;
+  auto_deploy?: boolean | null;
   detected_framework?: string | null;
   detected_branch?: string | null;
   detected_build_command?: string | null;

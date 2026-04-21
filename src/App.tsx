@@ -99,9 +99,9 @@ export default function App() {
   const [addingKey, setAddingKey] = useState(false);
   const [deletingKeyId, setDeletingKeyId] = useState<string | null>(null);
   const [form, setForm] = useState({
-    repoUrl: '',
-    freeDomainDomain: '',
-    freeDomainDnsApiKey: '',
+    repoUrl: 'https://github.com/Joshbond123/Blog-Automator',
+    ngrokDomain: 'unapprehended-overemotionally-jeni.ngrok-free.dev',
+    ngrokAuthtoken: '32pTZFDvSXQRyInodWnMJB5QNak_3EF2pDaRfzw2nZ9GQ9iwG',
   });
   const [envVars, setEnvVars] = useState<EnvVar[]>([]);
 
@@ -153,7 +153,11 @@ export default function App() {
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error ?? 'Deployment failed.');
       setSuccess(`Deployment queued: ${payload.deploymentId}`);
-      setForm({ repoUrl: '', freeDomainDomain: '', freeDomainDnsApiKey: '' });
+      setForm({
+        repoUrl: 'https://github.com/Joshbond123/Blog-Automator',
+        ngrokDomain: 'unapprehended-overemotionally-jeni.ngrok-free.dev',
+        ngrokAuthtoken: '32pTZFDvSXQRyInodWnMJB5QNak_3EF2pDaRfzw2nZ9GQ9iwG',
+      });
       setEnvVars([]);
       setTab('dashboard');
       await loadDashboard();
@@ -216,7 +220,7 @@ export default function App() {
         <header className="flex flex-col md:flex-row md:items-end md:justify-between gap-4">
           <div>
             <h1 className="text-3xl font-bold tracking-tight">ActionHost</h1>
-            <p className="text-sm text-text-muted mt-1">Temporary hosting with GitHub Actions + Quick Tunnel + FreeDomain DNS switching.</p>
+            <p className="text-sm text-text-muted mt-1">Temporary hosting with GitHub Actions + ngrok tunnel.</p>
           </div>
           <div className="flex flex-wrap gap-2">
             {(['dashboard', 'deploy', 'cerebras', 'settings'] as Tab[]).map((nextTab) => (
@@ -295,17 +299,17 @@ export default function App() {
         {tab === 'deploy' && !selectedProject && (
           <section className="max-w-4xl rounded-xl bg-card-bg border border-border p-6 space-y-5">
             <h2 className="text-xl font-bold flex items-center gap-2"><Activity className="w-5 h-5" /> New deployment</h2>
-            <p className="text-sm text-text-muted">Enter the GitHub repo you want to deploy. ActionHost will detect the framework, build it, and expose it via a Cloudflare tunnel with your FreeDomain DNS.</p>
+            <p className="text-sm text-text-muted">Enter the GitHub repo you want to deploy. ActionHost will detect the framework, build it, and expose it through your reserved ngrok domain.</p>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <Input label="GitHub repository URL" value={form.repoUrl} onChange={(value) => setForm((prev) => ({ ...prev, repoUrl: value }))} placeholder="https://github.com/owner/repo" />
-              <Input label="FreeDomain domain" value={form.freeDomainDomain} onChange={(value) => setForm((prev) => ({ ...prev, freeDomainDomain: value }))} placeholder="yourdomain.run.place" />
-              <Input label="DNSExit account API key" type="password" value={form.freeDomainDnsApiKey} onChange={(value) => setForm((prev) => ({ ...prev, freeDomainDnsApiKey: value }))} placeholder="Get from dnsexit.com → Account → API key" />
-              <div className="md:col-span-1 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800 self-end">
-                <strong>DNS API key:</strong> Log into <a href="https://dnsexit.com" target="_blank" rel="noreferrer" className="underline">dnsexit.com</a> → My Account → API Access to get your account API key. This is different from the FreeDomain dynamic DNS key.
+              <Input label="ngrok domain" value={form.ngrokDomain} onChange={(value) => setForm((prev) => ({ ...prev, ngrokDomain: value }))} placeholder="your-domain.ngrok-free.dev" />
+              <Input label="ngrok authtoken" type="password" value={form.ngrokAuthtoken} onChange={(value) => setForm((prev) => ({ ...prev, ngrokAuthtoken: value }))} placeholder="Get from dashboard.ngrok.com → Your Authtoken" />
+              <div className="md:col-span-1 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-xs text-emerald-800 self-end">
+                <strong>ngrok:</strong> Log into <a href="https://dashboard.ngrok.com" target="_blank" rel="noreferrer" className="underline">dashboard.ngrok.com</a> to get your authtoken and reserve a free static domain.
               </div>
               <EnvVarsEditor vars={envVars} onChange={setEnvVars} />
             </div>
-            <button onClick={submitDeploy} disabled={deploying || !form.repoUrl || !form.freeDomainDomain}
+            <button onClick={submitDeploy} disabled={deploying || !form.repoUrl || !form.ngrokDomain || !form.ngrokAuthtoken}
               className="bg-primary text-white px-5 py-2 rounded-lg text-sm font-semibold inline-flex items-center gap-2 disabled:opacity-50 transition">
               {deploying ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Activity className="w-4 h-4" />}
               {deploying ? 'Queuing deployment...' : 'Deploy'}
@@ -394,7 +398,7 @@ function ProjectDetails({ projectId, onBack }: { projectId: string; onBack: () =
 
   // Edit mode state
   const [editMode, setEditMode] = useState(false);
-  const [editForm, setEditForm] = useState({ repoUrl: '', domain: '', dnsApiKey: '' });
+  const [editForm, setEditForm] = useState({ repoUrl: '', domain: '', ngrokAuthtoken: '' });
   const [editEnvVars, setEditEnvVars] = useState<EnvVar[]>([]);
   const [saving, setSaving] = useState(false);
 
@@ -410,7 +414,7 @@ function ProjectDetails({ projectId, onBack }: { projectId: string; onBack: () =
         setLogs((logData ?? []) as LogEntry[]);
       }
       if (projectData) {
-        setEditForm({ repoUrl: (projectData as any).repo_url ?? '', domain: (projectData as any).domain ?? '', dnsApiKey: '' });
+        setEditForm({ repoUrl: (projectData as any).repo_url ?? '', domain: (projectData as any).domain ?? '', ngrokAuthtoken: '' });
       }
     };
     load();
@@ -430,8 +434,8 @@ function ProjectDetails({ projectId, onBack }: { projectId: string; onBack: () =
     try {
       const response = await functionFetch('/deploy', {
         repoUrl: project.repo_url,
-        freeDomainDomain: project.domain,
-        freeDomainDnsApiKey: '',
+        ngrokDomain: project.domain,
+        ngrokAuthtoken: '',
         projectId: project.id,
       });
       const payload = await response.json();
@@ -454,7 +458,7 @@ function ProjectDetails({ projectId, onBack }: { projectId: string; onBack: () =
         projectId,
         repoUrl: editForm.repoUrl,
         domain: editForm.domain,
-        dnsApiKey: editForm.dnsApiKey || undefined,
+        ngrokAuthtoken: editForm.ngrokAuthtoken || undefined,
         envVars: envObj,
         redeploy: true,
       });
@@ -547,10 +551,10 @@ function ProjectDetails({ projectId, onBack }: { projectId: string; onBack: () =
             <h3 className="font-semibold text-sm text-text-muted uppercase tracking-wide">Edit project settings</h3>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               <Input label="GitHub repository URL" value={editForm.repoUrl} onChange={(v) => setEditForm((p) => ({ ...p, repoUrl: v }))} placeholder="https://github.com/owner/repo" />
-              <Input label="FreeDomain domain" value={editForm.domain} onChange={(v) => setEditForm((p) => ({ ...p, domain: v }))} placeholder="yourdomain.run.place" />
-              <Input label="DNSExit account API key (leave blank to keep current)" type="password" value={editForm.dnsApiKey} onChange={(v) => setEditForm((p) => ({ ...p, dnsApiKey: v }))} placeholder="Leave blank to keep existing key" />
-              <div className="md:col-span-1 rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800 self-center">
-                Get your account API key from <a href="https://dnsexit.com" target="_blank" rel="noreferrer" className="underline">dnsexit.com</a> → My Account → API Access.
+              <Input label="ngrok domain" value={editForm.domain} onChange={(v) => setEditForm((p) => ({ ...p, domain: v }))} placeholder="your-domain.ngrok-free.dev" />
+              <Input label="ngrok authtoken (leave blank to keep current)" type="password" value={editForm.ngrokAuthtoken} onChange={(v) => setEditForm((p) => ({ ...p, ngrokAuthtoken: v }))} placeholder="Leave blank to keep existing token" />
+              <div className="md:col-span-1 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-xs text-emerald-800 self-center">
+                Get your authtoken from <a href="https://dashboard.ngrok.com" target="_blank" rel="noreferrer" className="underline">dashboard.ngrok.com</a> → Your Authtoken.
               </div>
               <EnvVarsEditor vars={editEnvVars} onChange={setEditEnvVars} />
             </div>

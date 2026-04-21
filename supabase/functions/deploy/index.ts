@@ -2,8 +2,8 @@ import { createClient } from 'https://esm.sh/@supabase/supabase-js@2.49.1';
 
 type DeployRequest = {
   repoUrl: string;
-  freeDomainDomain: string;
-  freeDomainDnsApiKey?: string;
+  ngrokDomain: string;
+  ngrokAuthtoken?: string;
   envVars?: Record<string, string>;
   projectId?: string; // if provided, redeploy existing project
 };
@@ -82,10 +82,10 @@ Deno.serve(async (request) => {
 
   try {
     const body = (await request.json()) as DeployRequest;
-    const { repoUrl, freeDomainDomain, freeDomainDnsApiKey, envVars, projectId: existingProjectId } = body;
+    const { repoUrl, ngrokDomain, ngrokAuthtoken, envVars, projectId: existingProjectId } = body;
 
     if (!repoUrl) throw new Error('repoUrl is required.');
-    if (!freeDomainDomain) throw new Error('freeDomainDomain is required.');
+    if (!ngrokDomain) throw new Error('ngrokDomain is required.');
 
     const supabaseUrl = Deno.env.get('SUPABASE_URL') ?? '';
     const supabaseServiceKey = Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '';
@@ -106,14 +106,17 @@ Deno.serve(async (request) => {
       project = existingProject;
     } else {
       // Create new project
+      if (!ngrokAuthtoken) throw new Error('ngrokAuthtoken is required for a new deployment.');
       const detection = await detectRepository(repoUrl, githubPat);
       const projectName = repoUrl.split('/').pop()?.replace(/\.git$/, '') ?? 'project';
 
       const { data: newProject, error: projectError } = await supabase.from('projects').insert({
         name: projectName,
         repo_url: repoUrl,
-        domain: freeDomainDomain,
-        free_domain_dns_api_key: freeDomainDnsApiKey ?? '',
+        domain: ngrokDomain,
+        ngrok_authtoken: ngrokAuthtoken,
+        free_domain_dns_api_key: '',
+        auto_deploy: true,
         detected_framework: detection.framework,
         detected_branch: detection.branch,
         detected_build_command: detection.buildCommand,
@@ -152,7 +155,7 @@ Deno.serve(async (request) => {
     await supabase.from('logs').insert({
       deployment_id: deployment.id,
       level: 'info',
-      message: `Deployment queued for ${project.repo_url}. Detected ${project.detected_framework} (branch: ${project.detected_branch}).`,
+      message: `Deployment queued for ${project.repo_url}. Detected ${project.detected_framework} (branch: ${project.detected_branch}). ngrok domain: ${project.domain}.`,
     });
 
     const dispatchRes = await fetch(

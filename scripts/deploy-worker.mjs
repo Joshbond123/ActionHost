@@ -1,6 +1,6 @@
 import { Octokit } from 'octokit';
 import { createClient } from '@supabase/supabase-js';
-import { execSync, spawnSync } from 'node:child_process';
+import { execSync } from 'node:child_process';
 import fs from 'node:fs';
 
 const deploymentId = process.env.DEPLOYMENT_ID;
@@ -35,80 +35,6 @@ const updateDeployment = async (payload) => {
   if (error) console.error('Failed to update deployment:', error.message);
 };
 
-const parseDomain = (domain) => {
-  const parts = domain.split('.');
-  if (parts.length < 2) throw new Error(`Invalid domain: ${domain}`);
-  return {
-    root: parts.slice(-2).join('.'),
-    host: parts.length > 2 ? parts.slice(0, -2).join('.') : '@',
-  };
-};
-
-const updateFreeDomainDns = async ({ domain, apiKey, targetHostname }) => {
-  if (!apiKey || apiKey === 'test' || apiKey.length < 5) {
-    return { ok: false, body: 'DNS API key not configured or invalid.' };
-  }
-  const { root, host } = parseDomain(domain);
-
-  // ── Strategy 1: DNSExit new REST API (api.dnsexit.com/dns/) ──────────────────
-  // The old RemoteUpdate.sv endpoint returns 503 consistently since ~April 2026.
-  // The new API requires your DNSExit ACCOUNT API key (from dnsexit.com → My Account → API Access).
-  try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
-    const response = await fetch('https://api.dnsexit.com/dns/', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      signal: controller.signal,
-      body: JSON.stringify({
-        apikey: apiKey,
-        domain: root,
-        update: [{ type: 'CNAME', host, data: targetHostname }],
-      }),
-    });
-    clearTimeout(timeout);
-    const body = await response.text();
-    console.log(`DNSExit new API: status=${response.status} body=${body}`);
-    try {
-      const parsed = JSON.parse(body);
-      // DNSExit new API returns {"code":0,...} on success
-      if (parsed.code === 0) return { ok: true, body };
-      // Auth error — API key is the old FreeDomain key, not account key
-      if (parsed.code === 2) {
-        await log('DNS API key is the old FreeDomain dynamic key. Get your account API key from dnsexit.com → My Account → API Access.', 'warn');
-      } else {
-        await log(`DNSExit new API error (code ${parsed.code}): ${parsed.message}`, 'warn');
-      }
-    } catch {
-      if (response.ok) return { ok: true, body };
-    }
-  } catch (err) {
-    console.error('DNSExit new API failed:', err.message);
-  }
-
-  // ── Strategy 2: Legacy RemoteUpdate.sv (may return 503 if endpoint is down) ──
-  const legacyBase = process.env.FREEDOMAIN_DNS_API_BASE || 'https://update.dnsexit.com/RemoteUpdate.sv';
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      const url = `${legacyBase}?apikey=${encodeURIComponent(apiKey)}&domain=${encodeURIComponent(root)}&host=${encodeURIComponent(host)}&recordtype=CNAME&target=${encodeURIComponent(targetHostname)}`;
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 12000);
-      const response = await fetch(url, { method: 'GET', signal: controller.signal });
-      clearTimeout(timeout);
-      const body = await response.text();
-      console.log(`DNSExit legacy API attempt ${attempt}: status=${response.status} body=${body.slice(0, 100)}`);
-      if (response.ok && body.startsWith('0=')) return { ok: true, body };
-      if (response.ok && /^(ok|success|good|nochg)/i.test(body.trim())) return { ok: true, body };
-      if (response.status >= 500) await log(`DNS legacy API returned ${response.status} (endpoint may be down).`, 'warn');
-    } catch (err) {
-      console.error(`DNS legacy attempt ${attempt} error:`, err.message);
-    }
-    if (attempt < 2) await wait(5000);
-  }
-
-  return { ok: false, body: 'All DNS update methods failed. Use your DNSExit account API key (from dnsexit.com → My Account → API Access) or set the CNAME record manually.' };
-};
-
 const verifyUrlHealthy = async (url, maxAttempts = 8, delayMs = 5000) => {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
@@ -133,14 +59,28 @@ if (projectError) {
   process.exit(1);
 }
 
+if (!project.ngrok_authtoken) {
+  await updateDeployment({ status: 'failed', error_message: 'ngrok authtoken is not configured for this project.' });
+  await log('Project has no ngrok_authtoken configured. Edit the project and add it.', 'error');
+  process.exit(1);
+}
+if (!project.domain) {
+  await updateDeployment({ status: 'failed', error_message: 'ngrok domain is not configured for this project.' });
+  await log('Project has no ngrok domain configured.', 'error');
+  process.exit(1);
+}
+
 await updateDeployment({ status: 'starting', workflow_status: 'in_progress', workflow_run_id: workflowRunId || null });
 await log(`Starting deployment for ${project.repo_url}`);
 await log(`Framework: ${project.detected_framework ?? 'unknown'} | Branch: ${project.detected_branch ?? 'main'}`);
+await log(`ngrok domain: ${project.domain}`);
 
-// Clone repository
+// Clone repository (track latest SHA for auto-deploy)
 await log('Cloning repository...');
+let latestSha = '';
 try {
   execSync(`git clone --depth 1 ${project.repo_url} target-app`, { stdio: 'inherit' });
+  try { latestSha = execSync('git rev-parse HEAD', { cwd: 'target-app' }).toString().trim(); } catch { /* non-fatal */ }
 } catch (err) {
   await updateDeployment({ status: 'failed', error_message: `git clone failed: ${err.message}` });
   await log(`git clone failed: ${err.message}`, 'error');
@@ -228,55 +168,62 @@ if (!appStarted) {
   await log(`App not responding on port ${APP_PORT} after 9s, proceeding with tunnel anyway...`, 'warn');
 }
 
-// Download and start Cloudflare Quick Tunnel
-await log('Starting Cloudflare Quick Tunnel...');
+// Download and start ngrok
+await log('Downloading ngrok...');
 try {
   execSync(
-    'curl -fsSL -o cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && chmod +x cloudflared',
+    'curl -fsSL -o ngrok.tgz https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.tgz && tar -xzf ngrok.tgz && chmod +x ngrok',
     { stdio: 'inherit' }
   );
 } catch (err) {
-  try {
-    await log('Primary cloudflared download failed, trying wget...', 'warn');
-    execSync(
-      'wget -q -O cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && chmod +x cloudflared',
-      { stdio: 'inherit' }
-    );
-  } catch (err2) {
-    await updateDeployment({ status: 'failed', error_message: `cloudflared download failed: ${err2.message}` });
-    await log(`cloudflared download failed: ${err2.message}`, 'error');
-    process.exit(1);
-  }
+  await updateDeployment({ status: 'failed', error_message: `ngrok download failed: ${err.message}` });
+  await log(`ngrok download failed: ${err.message}`, 'error');
+  process.exit(1);
 }
 
-// Start tunnel in background
+// Configure ngrok authtoken
+await log('Configuring ngrok authtoken...');
+try {
+  execSync(`./ngrok config add-authtoken ${project.ngrok_authtoken}`, { stdio: 'inherit' });
+} catch (err) {
+  await updateDeployment({ status: 'failed', error_message: `ngrok authtoken config failed: ${err.message}` });
+  await log(`ngrok authtoken config failed: ${err.message}`, 'error');
+  process.exit(1);
+}
+
+// Start ngrok bound to the reserved domain
+await log(`Starting ngrok tunnel bound to ${project.domain}...`);
 fs.writeFileSync('start-tunnel.sh', `#!/bin/bash
-./cloudflared tunnel --url http://localhost:${APP_PORT} --no-autoupdate >> tunnel.log 2>&1 &
+./ngrok http --domain=${project.domain} ${APP_PORT} --log=stdout >> tunnel.log 2>&1 &
 echo $! > tunnel.pid
 `);
 execSync('chmod +x start-tunnel.sh && bash start-tunnel.sh', { stdio: 'inherit' });
 
-// Wait for tunnel URL to appear in log (up to 60s)
-let publicUrl = null;
+// Wait for ngrok to confirm tunnel is online (poll its local API at :4040)
+let publicUrl = `https://${project.domain}`;
+let tunnelOnline = false;
 for (let i = 0; i < 30; i++) {
   await wait(2000);
-  if (fs.existsSync('tunnel.log')) {
-    const tunnelLog = fs.readFileSync('tunnel.log', 'utf8');
-    const urlMatch = tunnelLog.match(/https:\/\/[a-z0-9-]+\.trycloudflare\.com/i);
-    if (urlMatch) {
-      publicUrl = urlMatch[0];
-      break;
+  try {
+    const res = await fetch('http://127.0.0.1:4040/api/tunnels');
+    if (res.ok) {
+      const payload = await res.json();
+      const tunnels = payload.tunnels || [];
+      const match = tunnels.find((t) => (t.public_url || '').includes(project.domain));
+      if (match) { publicUrl = match.public_url; tunnelOnline = true; break; }
+      if (tunnels.length > 0) { publicUrl = tunnels[0].public_url; tunnelOnline = true; break; }
     }
+  } catch {
+    // ngrok api not up yet
   }
 }
 
-if (!publicUrl) {
+if (!tunnelOnline) {
   const tunnelLog = fs.existsSync('tunnel.log') ? fs.readFileSync('tunnel.log', 'utf8') : '(no log)';
   const appLog = fs.existsSync('app.log') ? fs.readFileSync('app.log', 'utf8').slice(-500) : '(no log)';
-  await updateDeployment({ status: 'failed', workflow_status: 'failed', error_message: 'Unable to parse tunnel URL from cloudflared output.' });
+  await updateDeployment({ status: 'failed', workflow_status: 'failed', error_message: 'ngrok tunnel did not come online.' });
   await log(`App log: ${appLog}`, 'error');
   await log(`Tunnel log: ${tunnelLog}`, 'error');
-  await log('Unable to parse tunnel URL.', 'error');
   process.exit(1);
 }
 
@@ -284,10 +231,7 @@ const tunnelHostname = new URL(publicUrl).hostname;
 await updateDeployment({ status: 'warming', public_url: publicUrl, tunnel_hostname: tunnelHostname, workflow_status: 'running' });
 await log(`Tunnel ready: ${publicUrl}`);
 
-// Health check: check the app responds on localhost (NOT the public tunnel URL).
-// Checking the tunnel URL from inside the same runner requires a round-trip over the
-// internet back to itself, which routinely fails with 5xx even when the tunnel is live.
-// If the local port is up, cloudflared is forwarding it correctly.
+// Health check on localhost (the tunnel forwards to it)
 await log(`Verifying app is responding on localhost:${APP_PORT}...`);
 const localHealthy = await verifyUrlHealthy(`http://localhost:${APP_PORT}`, 12, 5000);
 if (!localHealthy) {
@@ -301,43 +245,17 @@ if (!localHealthy) {
 await updateDeployment({ status: 'ready', health_status: 'healthy' });
 await log(`App health check passed — responding on localhost:${APP_PORT}.`);
 
-// Update FreeDomain DNS — non-fatal (tunnel is still live even if DNS fails)
-let dnsSuccess = false;
-if (project.domain && project.domain !== 'test.example.com' && project.free_domain_dns_api_key) {
-  await log(`Updating FreeDomain DNS for domain: ${project.domain}`);
-  const dnsResult = await updateFreeDomainDns({
+// Record domain mapping (ngrok handles DNS automatically — no manual update needed)
+await supabase.from('domain_mappings').upsert(
+  {
     domain: project.domain,
-    apiKey: project.free_domain_dns_api_key,
-    targetHostname: tunnelHostname,
-  });
-
-  if (!dnsResult.ok) {
-    await log(`DNS update failed: ${dnsResult.body}. Tunnel is still live at: ${publicUrl}`, 'warn');
-    await supabase.from('domain_mappings').upsert(
-      { domain: project.domain, dns_status: 'failed', tunnel_hostname: tunnelHostname },
-      { onConflict: 'domain' },
-    );
-  } else {
-    dnsSuccess = true;
-    await log(`DNS update accepted: ${dnsResult.body}`);
-
-    const domainHealthy = await verifyUrlHealthy(`https://${project.domain}`, 12, 10000);
-    if (!domainHealthy) {
-      await log('Domain health check failed. DNS may still be propagating.', 'warn');
-    }
-
-    await supabase.from('domain_mappings').upsert(
-      {
-        domain: project.domain,
-        active_deployment_id: deploymentId,
-        tunnel_hostname: tunnelHostname,
-        last_dns_update_at: new Date().toISOString(),
-        dns_status: domainHealthy ? 'active' : 'pending',
-      },
-      { onConflict: 'domain' },
-    );
-  }
-}
+    active_deployment_id: deploymentId,
+    tunnel_hostname: tunnelHostname,
+    last_dns_update_at: new Date().toISOString(),
+    dns_status: 'active',
+  },
+  { onConflict: 'domain' },
+);
 
 await updateDeployment({
   status: 'active',
@@ -345,10 +263,15 @@ await updateDeployment({
   became_active_at: new Date().toISOString(),
 });
 
-await log(dnsSuccess
-  ? 'Deployment active. Domain is live.'
-  : `Deployment active. App is live at tunnel URL: ${publicUrl}`
-);
+// Persist last deployed commit SHA for auto-deploy comparison
+if (latestSha) {
+  try {
+    await supabase.from('projects').update({ last_deployed_sha: latestSha }).eq('id', projectId);
+    await log(`Recorded deployed commit: ${latestSha.slice(0, 8)}`);
+  } catch { /* non-fatal */ }
+}
+
+await log(`Deployment active. App is live at: ${publicUrl}`);
 
 // Mark old deployments as stopped
 const { data: oldDeployments } = await supabase
@@ -386,14 +309,13 @@ try {
 }
 
 await log('Deployment worker finished. App is live!');
-await log(`Tunnel URL: ${publicUrl}`);
+await log(`Public URL: ${publicUrl}`);
 
 // Keep runner alive to maintain the tunnel and app
 await log('Keeping runner alive to maintain tunnel and app server...');
 while (true) {
   try {
     await wait(60000);
-    // Check localhost (not the public tunnel URL — runner can't reliably reach its own tunnel externally)
     const stillHealthy = await verifyUrlHealthy(`http://localhost:${APP_PORT}`, 2, 3000);
     if (!stillHealthy) {
       await log(`App on localhost:${APP_PORT} appears unresponsive - tunnel may be degraded`, 'warn');
@@ -402,7 +324,6 @@ while (true) {
       await updateDeployment({ health_status: 'healthy' });
     }
   } catch (err) {
-    // Never let an unhandled exception kill the runner — that would tear down the tunnel
     console.error('[keep-alive] Caught error (non-fatal, continuing):', err?.message);
   }
 }

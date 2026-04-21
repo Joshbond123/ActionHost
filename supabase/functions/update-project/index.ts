@@ -10,7 +10,7 @@ Deno.serve(async (request) => {
 
   try {
     const body = await request.json();
-    const { projectId, repoUrl, domain, dnsApiKey, envVars, redeploy } = body;
+    const { projectId, repoUrl, domain, ngrokAuthtoken, envVars, redeploy } = body;
 
     if (!projectId) throw new Error('projectId is required.');
 
@@ -27,7 +27,7 @@ Deno.serve(async (request) => {
     const updatePayload: Record<string, unknown> = {};
     if (repoUrl) updatePayload.repo_url = repoUrl;
     if (domain) updatePayload.domain = domain;
-    if (dnsApiKey) updatePayload.free_domain_dns_api_key = dnsApiKey;
+    if (ngrokAuthtoken) updatePayload.ngrok_authtoken = ngrokAuthtoken;
 
     // Update project fields if any changed
     if (Object.keys(updatePayload).length > 0) {

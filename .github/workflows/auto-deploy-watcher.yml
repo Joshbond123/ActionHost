@@ -1,22 +1,18 @@
-name: Deploy Worker
+name: Auto Deploy Watcher
 
 on:
+  schedule:
+    - cron: '*/5 * * * *'
   workflow_dispatch:
-    inputs:
-      project_id:
-        required: true
-        type: string
-      deployment_id:
-        required: true
-        type: string
 
 permissions:
   contents: read
+  actions: write
 
 jobs:
-  deploy:
+  watch:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    timeout-minutes: 10
     steps:
       - name: Checkout ActionHost
         uses: actions/checkout@v4
@@ -30,12 +26,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run deployment worker
-        run: node scripts/deploy-worker.mjs
+      - name: Run auto-deploy watcher
+        run: node scripts/auto-deploy-watcher.mjs
         env:
-          PROJECT_ID: ${{ inputs.project_id }}
-          DEPLOYMENT_ID: ${{ inputs.deployment_id }}
-          GITHUB_RUN_ID: ${{ github.run_id }}
           GITHUB_PAT: ${{ vars.ACTIONHOST_GITHUB_PAT }}
           ACTIONHOST_REPO_PATH: ${{ vars.ACTIONHOST_REPO_PATH }}
           SUPABASE_URL: ${{ vars.ACTIONHOST_SUPABASE_URL }}
