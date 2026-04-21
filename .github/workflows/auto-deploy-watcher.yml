@@ -1,10 +1,16 @@
 name: Auto Deploy Watcher
 
-# Cron polling has been replaced by instant GitHub webhooks (see the
-# `github-webhook` Supabase edge function and the registerGithubWebhook helper
-# in the `deploy` function). This workflow remains available as a manual
-# fallback in case a webhook is missed or temporarily fails.
+# Hybrid auto-deploy strategy:
+#   PRIMARY: GitHub push webhooks deliver commit events instantly to the
+#            `github-webhook` Supabase edge function (zero-latency redeploy).
+#   FALLBACK: This cron-driven poller runs every 5 minutes to catch projects
+#             whose repo couldn't have a webhook installed (e.g. PAT missing
+#             admin:repo_hook scope, third-party repos without admin access,
+#             or transient webhook delivery failures). Idempotent — only
+#             dispatches when the latest SHA differs from last_deployed_sha.
 on:
+  schedule:
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 permissions:
