@@ -1,0 +1,7 @@
+# Supabase project configuration overrides applied by `supabase functions deploy`.
+# Functions listed below have their JWT verification disabled because they are
+# called by external systems (e.g. GitHub webhooks) that don't know how to send
+# a Supabase JWT — they authenticate via their own signature instead.
+
+[functions.github-webhook]
+verify_jwt = false
