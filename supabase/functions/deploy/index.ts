@@ -77,6 +77,56 @@ const detectRepository = async (repoUrl: string, githubPat?: string): Promise<De
   return { ...detected, branch: defaultBranch };
 };
 
+// Register a GitHub push webhook on the user's repository so that future
+// commits trigger an instant redeploy (handled by the github-webhook function).
+// Idempotent: if a webhook with the same target URL already exists, we skip.
+const registerGithubWebhook = async (params: {
+  repoUrl: string;
+  githubPat: string;
+  webhookUrl: string;
+  webhookSecret: string;
+}): Promise<{ ok: boolean; reason?: string }> => {
+  try {
+    const { owner, repo } = repoParser(params.repoUrl);
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${params.githubPat}`,
+      Accept: 'application/vnd.github+json',
+      'Content-Type': 'application/json',
+    };
+
+    // List existing hooks to keep this idempotent
+    const listRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/hooks`, { headers });
+    if (listRes.ok) {
+      const hooks = (await listRes.json()) as Array<{ id: number; config?: { url?: string } }>;
+      const existing = hooks.find((h) => h.config?.url === params.webhookUrl);
+      if (existing) return { ok: true, reason: 'already exists' };
+    }
+
+    const createRes = await fetch(`https://api.github.com/repos/${owner}/${repo}/hooks`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({
+        name: 'web',
+        active: true,
+        events: ['push'],
+        config: {
+          url: params.webhookUrl,
+          content_type: 'json',
+          secret: params.webhookSecret,
+          insecure_ssl: '0',
+        },
+      }),
+    });
+    if (!createRes.ok) {
+      const reason = await createRes.text();
+      return { ok: false, reason: `${createRes.status}: ${reason.slice(0, 200)}` };
+    }
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, reason: (err as Error).message };
+  }
+};
+
 Deno.serve(async (request) => {
   if (request.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders });
 
@@ -133,6 +183,17 @@ Deno.serve(async (request) => {
           { key: `env_${project.id}`, value: JSON.stringify(envVars), updated_at: new Date().toISOString() },
           { onConflict: 'key' }
         );
+      }
+
+      // Register a GitHub push webhook on the user repo so future commits
+      // trigger an instant redeploy. Non-fatal: deploy proceeds even if it fails.
+      const webhookSecret = Deno.env.get('GITHUB_WEBHOOK_SECRET') ?? '';
+      if (webhookSecret) {
+        const webhookUrl = `${supabaseUrl}/functions/v1/github-webhook`;
+        const hookResult = await registerGithubWebhook({ repoUrl, githubPat, webhookUrl, webhookSecret });
+        console.log(`Webhook registration for ${repoUrl}: ${hookResult.ok ? 'ok' : 'failed'} (${hookResult.reason ?? ''})`);
+      } else {
+        console.log('GITHUB_WEBHOOK_SECRET not set — skipping webhook registration.');
       }
     }
 
