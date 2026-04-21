@@ -100,10 +100,11 @@ const ensureDefaultProject = async () => {
 
 await ensureDefaultProject();
 
-const projectsResult = await supabase.from('projects').select('*').eq('auto_deploy_enabled', true);
+const projectsResult = await supabase.from('projects').select('*');
 if (projectsResult.error) throw projectsResult.error;
 
 for (const project of projectsResult.data ?? []) {
+  if (project.auto_deploy_enabled === false) continue;
   const { owner, repo } = parseRepo(project.repo_url);
   const branch = project.detected_branch || 'main';
   const latestCommit = await octokit.rest.repos.getCommit({ owner, repo, ref: branch });
