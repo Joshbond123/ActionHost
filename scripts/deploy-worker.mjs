@@ -94,14 +94,38 @@ try {
       await supabase.from('deployments').update({ status: 'draining', workflow_status: 'draining' }).eq('id', old.id);
 
       if (old.workflow_run_id && process.env.GITHUB_PAT && process.env.ACTIONHOST_REPO_PATH) {
+        const octokit = new Octokit({ auth: process.env.GITHUB_PAT });
+        const [owner, repo] = process.env.ACTIONHOST_REPO_PATH.split('/');
+
+        // Check the run's current state first so we don't try to cancel
+        // something that already finished (which returns 409).
+        let runStatus = null;
         try {
-          const octokit = new Octokit({ auth: process.env.GITHUB_PAT });
-          const [owner, repo] = process.env.ACTIONHOST_REPO_PATH.split('/');
-          await octokit.rest.actions.cancelWorkflowRun({ owner, repo, run_id: Number(old.workflow_run_id) });
-          await log(`Cancelled previous workflow run ${old.workflow_run_id} (deployment ${old.id.slice(0, 8)}).`);
-          cancelledAny = true;
+          const { data: runInfo } = await octokit.rest.actions.getWorkflowRun({
+            owner, repo, run_id: Number(old.workflow_run_id),
+          });
+          runStatus = runInfo.status; // queued | in_progress | completed | waiting
         } catch (err) {
-          await log(`Could not cancel prior workflow run ${old.workflow_run_id}: ${err.message}`, 'warn');
+          await log(`Prior workflow run ${old.workflow_run_id} state unknown (${err.message}); assuming finished.`);
+        }
+
+        if (runStatus === 'queued' || runStatus === 'in_progress' || runStatus === 'waiting') {
+          try {
+            await octokit.rest.actions.cancelWorkflowRun({
+              owner, repo, run_id: Number(old.workflow_run_id),
+            });
+            await log(`Cancelled previous workflow run ${old.workflow_run_id} (deployment ${old.id.slice(0, 8)}).`);
+            cancelledAny = true;
+          } catch (err) {
+            // 409 race: it finished between GET and CANCEL — treat as already-stopped.
+            if (String(err.message).includes('Cannot cancel a workflow run that is completed')) {
+              await log(`Prior workflow run ${old.workflow_run_id} finished on its own; domain is free.`);
+            } else {
+              await log(`Could not cancel prior workflow run ${old.workflow_run_id}: ${err.message}`, 'warn');
+            }
+          }
+        } else {
+          await log(`Prior workflow run ${old.workflow_run_id} already finished; ngrok endpoint should be free.`);
         }
       }
 
