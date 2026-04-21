@@ -1,8 +1,10 @@
 name: Auto Deploy Watcher
 
+# Cron polling has been replaced by instant GitHub webhooks (see the
+# `github-webhook` Supabase edge function and the registerGithubWebhook helper
+# in the `deploy` function). This workflow remains available as a manual
+# fallback in case a webhook is missed or temporarily fails.
 on:
-  schedule:
-    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 permissions:
