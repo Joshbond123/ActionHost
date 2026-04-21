@@ -1,42 +1,51 @@
 export type ProjectStatus = 'queued' | 'starting' | 'warming' | 'ready' | 'active' | 'draining' | 'stopped' | 'failed';
-export type HealthStatus = 'pending' | 'healthy' | 'unhealthy';
 
-export interface Project {
-  id: string;
-  name: string;
-  repo_url: string;
-  ngrok_domain: string;
-  auto_deploy_enabled: boolean;
-  detected_framework?: string | null;
-  detected_branch?: string | null;
-  detected_build_command?: string | null;
-  detected_start_command?: string | null;
-  deployment_strategy?: string | null;
-  latest_seen_commit_sha?: string | null;
-  latest_deployed_commit_sha?: string | null;
-  created_at: string;
-  deployments?: Deployment[];
-}
+export type HealthStatus = 'pending' | 'healthy' | 'unhealthy';
 
 export interface Deployment {
   id: string;
   project_id: string;
   repo_url: string;
-  branch?: string | null;
-  commit_sha?: string | null;
-  detected_framework?: string | null;
-  detected_build_command?: string | null;
-  detected_start_command?: string | null;
+  domain: string;
+  tunnel_hostname?: string | null;
+  public_url?: string | null;
   workflow_run_id?: string | null;
   workflow_status?: string | null;
-  public_url?: string | null;
-  ngrok_domain?: string | null;
   status: ProjectStatus;
   health_status: HealthStatus;
+  detected_framework?: string | null;
+  detected_branch?: string | null;
+  detected_build_command?: string | null;
+  detected_start_command?: string | null;
+  deployment_strategy?: string | null;
   error_message?: string | null;
   created_at: string;
   became_active_at?: string | null;
   expires_at?: string | null;
+}
+
+export interface Project {
+  id: string;
+  name: string;
+  repo_url: string;
+  domain: string;
+  detected_framework?: string | null;
+  detected_branch?: string | null;
+  detected_build_command?: string | null;
+  detected_start_command?: string | null;
+  deployment_strategy?: string | null;
+  created_at: string;
+  deployments?: Deployment[];
+}
+
+export interface DomainMapping {
+  id: string;
+  domain: string;
+  active_deployment_id?: string | null;
+  last_dns_update_at?: string | null;
+  dns_status: 'pending' | 'active' | 'failed';
+  tunnel_hostname?: string | null;
+  created_at: string;
 }
 
 export interface LogEntry {
