@@ -2,6 +2,32 @@ import { createClient } from '@supabase/supabase-js';
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
 
+// Reconcile deployments stuck in 'queued' — these mean a dispatch never
+// completed (e.g. this very scheduler was disabled by GitHub for inactivity,
+// or the GitHub Actions dispatch call failed). Without this, they linger
+// forever and the dashboard/history fill up with dead rows.
+const staleQueuedThreshold = new Date(Date.now() - 20 * 60 * 1000).toISOString();
+const { data: staleQueued, error: staleQueuedError } = await supabase
+  .from('deployments')
+  .select('id, project_id')
+  .eq('status', 'queued')
+  .lte('created_at', staleQueuedThreshold);
+
+if (staleQueuedError) throw staleQueuedError;
+for (const stale of staleQueued ?? []) {
+  await supabase.from('deployments').update({
+    status: 'failed',
+    workflow_status: 'failed',
+    error_message: 'Deployment was queued but never picked up (dispatch stalled or scheduler was inactive).',
+  }).eq('id', stale.id);
+  await supabase.from('logs').insert({
+    deployment_id: stale.id,
+    level: 'error',
+    message: 'Marked as failed: stuck in queued state for over 20 minutes.',
+  });
+  console.log(`Marked stale queued deployment ${stale.id} as failed.`);
+}
+
 const threshold = new Date(Date.now() + 30 * 60 * 1000).toISOString();
 
 const { data: activeNearExpiry, error } = await supabase
