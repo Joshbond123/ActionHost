@@ -59,6 +59,12 @@ if (projectError) {
   process.exit(1);
 }
 
+const { data: deployment, error: deploymentLoadError } = await supabase.from('deployments').select('expires_at').eq('id', deploymentId).single();
+if (deploymentLoadError) {
+  console.error('Failed to load deployment:', deploymentLoadError.message);
+  process.exit(1);
+}
+
 if (!project.ngrok_authtoken) {
   await updateDeployment({ status: 'failed', error_message: 'ngrok authtoken is not configured for this project.' });
   await log('Project has no ngrok_authtoken configured. Edit the project and add it.', 'error');
@@ -382,17 +388,79 @@ try {
 await log('Deployment worker finished. App is live!');
 await log(`Public URL: ${publicUrl}`);
 
-// Keep runner alive to maintain the tunnel and app
+// Keep runner alive to maintain the tunnel and app.
+// This loop is also a self-healing safety net: it verifies the ACTUAL public
+// ngrok URL (not just localhost, which stays "healthy" even if the tunnel itself
+// drops), and it self-triggers the next rotation before this run's expires_at,
+// so the site keeps rotating even if the external cron-based Rotation Scheduler
+// workflow gets disabled by GitHub for inactivity.
+const expiresAtMs = deployment.expires_at ? new Date(deployment.expires_at).getTime() : null;
+const ROTATE_BEFORE_MS = 20 * 60 * 1000; // trigger replacement 20 min before expiry
+let rotationTriggered = false;
+let consecutivePublicFailures = 0;
+
+const triggerSelfRotation = async () => {
+  if (rotationTriggered) return;
+  rotationTriggered = true;
+  await log('Self-healing: proactively triggering replacement deployment before this run expires.');
+  try {
+    const { data: queued, error: queuedError } = await supabase.from('deployments').insert({
+      project_id: project.id,
+      repo_url: project.repo_url,
+      domain: project.domain,
+      status: 'queued',
+      workflow_status: 'queued',
+      health_status: 'pending',
+      detected_framework: project.detected_framework,
+      detected_branch: project.detected_branch,
+      detected_build_command: project.detected_build_command,
+      detected_start_command: project.detected_start_command,
+      deployment_strategy: project.deployment_strategy,
+      expires_at: new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString(),
+    }).select().single();
+    if (queuedError) throw queuedError;
+
+    const dispatchRes = await fetch(
+      `https://api.github.com/repos/${process.env.ACTIONHOST_REPO_PATH}/actions/workflows/deploy-worker.yml/dispatches`,
+      {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${process.env.GITHUB_PAT}`, Accept: 'application/vnd.github+json', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ref: 'main', inputs: { project_id: project.id, deployment_id: queued.id } }),
+      },
+    );
+    if (!dispatchRes.ok) throw new Error(`dispatch failed: ${dispatchRes.status} ${await dispatchRes.text()}`);
+    await log(`Self-healing: replacement deployment ${queued.id} queued and dispatched.`);
+  } catch (err) {
+    rotationTriggered = false; // allow retry on next tick
+    await log(`Self-healing rotation attempt failed, will retry: ${err.message}`, 'warn');
+  }
+};
+
 await log('Keeping runner alive to maintain tunnel and app server...');
 while (true) {
   try {
     await wait(60000);
-    const stillHealthy = await verifyUrlHealthy(`http://localhost:${APP_PORT}`, 2, 3000);
-    if (!stillHealthy) {
-      await log(`App on localhost:${APP_PORT} appears unresponsive - tunnel may be degraded`, 'warn');
+
+    const localHealthyNow = await verifyUrlHealthy(`http://localhost:${APP_PORT}`, 2, 3000);
+    const publicHealthyNow = await verifyUrlHealthy(publicUrl, 2, 5000);
+
+    if (!localHealthyNow || !publicHealthyNow) {
+      consecutivePublicFailures++;
+      await log(`Health check failed (local=${localHealthyNow}, public=${publicHealthyNow}), attempt ${consecutivePublicFailures}`, 'warn');
       await updateDeployment({ health_status: 'unhealthy' });
+      // If the public tunnel has been unreachable for a while, stop claiming we're active
+      // and proactively trigger a replacement instead of waiting for expiry.
+      if (consecutivePublicFailures >= 3) {
+        await updateDeployment({ status: 'expired', workflow_status: 'expired', error_message: 'Public URL stopped responding (tunnel likely dropped).' });
+        await triggerSelfRotation();
+      }
     } else {
+      consecutivePublicFailures = 0;
       await updateDeployment({ health_status: 'healthy' });
+    }
+
+    if (expiresAtMs && Date.now() >= expiresAtMs - ROTATE_BEFORE_MS) {
+      await triggerSelfRotation();
     }
   } catch (err) {
     console.error('[keep-alive] Caught error (non-fatal, continuing):', err?.message);
