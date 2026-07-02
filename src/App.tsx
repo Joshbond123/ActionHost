@@ -406,7 +406,7 @@ function ProjectDetails({ projectId, onBack }: { projectId: string; onBack: () =
     if (!supabase) return;
     const load = async () => {
       const { data: projectData } = await supabase.from('projects').select('*').eq('id', projectId).single();
-      const { data: deploymentData } = await supabase.from('deployments').select('*').eq('project_id', projectId).order('created_at', { ascending: false });
+      const { data: deploymentData } = await supabase.from('deployments').select('*').eq('project_id', projectId).order('created_at', { ascending: false }).limit(8);
       setProject(projectData as Project);
       setDeployments((deploymentData ?? []) as Deployment[]);
       if (deploymentData?.length) {
