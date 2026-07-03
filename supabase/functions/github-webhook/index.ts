@@ -118,6 +118,15 @@ Deno.serve(async (request) => {
         continue;
       }
 
+      // Projects missing required ngrok config can never deploy successfully
+      // — deploy-worker.mjs immediately fails them with "ngrok
+      // authtoken/domain is not configured". Without this guard, every push
+      // to a misconfigured project's repo creates a guaranteed-failing
+      // deployment and wastes a GitHub Actions run. Skip until configured.
+      if (!project.ngrok_authtoken || !project.domain) {
+        continue;
+      }
+
       const { data: deployment, error: depErr } = await supabase.from('deployments').insert({
         project_id: project.id,
         repo_url: project.repo_url,
