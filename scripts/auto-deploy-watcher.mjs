@@ -62,7 +62,21 @@ const candidates = (projects ?? []).filter((p) => p.auto_deploy !== false && p.r
 console.log(`Auto-deploy watcher: ${candidates.length} project(s) eligible.`);
 
 let triggered = 0;
+let skippedUnconfigured = 0;
 for (const project of candidates) {
+  // Projects missing required ngrok config can never deploy successfully —
+  // deploy-worker.mjs immediately fails them with "ngrok authtoken/domain is
+  // not configured". Without this guard, this watcher (running every 5 min)
+  // re-queues and re-dispatches a doomed deployment for every misconfigured
+  // project forever, flooding the deployments table and GitHub Actions with
+  // guaranteed failures. Skip them here instead — nothing to redeploy until
+  // the project is actually configured.
+  if (!project.ngrok_authtoken || !project.domain) {
+    skippedUnconfigured++;
+    console.log(`Skip ${project.id} (${project.name || project.repo_url}): missing ${!project.ngrok_authtoken ? 'ngrok_authtoken' : 'domain'} — not deployable yet.`);
+    continue;
+  }
+
   const parsed = parseRepo(project.repo_url);
   if (!parsed) { console.log(`Skip ${project.id}: unparseable repo_url ${project.repo_url}`); continue; }
 
@@ -113,4 +127,4 @@ for (const project of candidates) {
   }
 }
 
-console.log(`Auto-deploy watcher done. Triggered ${triggered} deployment(s).`);
+console.log(`Auto-deploy watcher done. Triggered ${triggered} deployment(s). Skipped ${skippedUnconfigured} unconfigured project(s).`);
